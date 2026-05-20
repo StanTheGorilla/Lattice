@@ -1,0 +1,214 @@
+"""Chat endpoint (SPEC §5.6).
+
+Receives a {session_id, message} pair, replays prior turns for that session_id
+from the `conversations` table (up to `chat_history_turns`), runs the agent
+loop, and persists every message (user, assistant, tool) back to the table.
+
+Session idle reset: if the most recent row for this session_id is older than
+`chat_session_idle_minutes`, prior turns are NOT replayed. This matches SPEC
+§4.4 ("session_id resets after 30 min idle"). Clients can either reuse the
+same session_id and rely on this server-side filter, or rotate the id
+themselves — both work.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import UTC, datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from lattice.auth import require_auth
+from lattice.config import settings
+from lattice.db import get_session
+from lattice.integrations.deepseek import (
+    DeepSeekAuthError,
+    DeepSeekAuthMissing,
+    DeepSeekUnavailable,
+)
+from lattice.llm.budget import BudgetExceeded
+from lattice.llm.router import run_agent
+from lattice.models import Conversation
+from lattice.schemas.chat import ChatRequest, ChatResponse, ToolCallSummary
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(require_auth)])
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _is_within_idle_window(latest_ts: str | None) -> bool:
+    """True if `latest_ts` is younger than the session idle threshold."""
+    if not latest_ts:
+        return False
+    try:
+        ts = datetime.fromisoformat(latest_ts)
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return datetime.now(UTC) - ts < timedelta(minutes=settings.chat_session_idle_minutes)
+
+
+async def _load_history(
+    session: AsyncSession, session_id: str,
+) -> list[dict[str, object]]:
+    """Return the prior {role, content, tool_calls?} messages for this session
+    if they are still within the idle window; otherwise empty.
+
+    Persisted as one DB row per message. We cap reload at chat_history_turns
+    rows — older context is fine to drop since the system prompt is rebuilt
+    each turn.
+    """
+    stmt = (
+        select(Conversation)
+        .where(Conversation.session_id == session_id)
+        .order_by(Conversation.timestamp.desc())
+        .limit(settings.chat_history_turns)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    if not rows:
+        return []
+
+    latest_ts = rows[0].timestamp
+    if not _is_within_idle_window(latest_ts):
+        return []
+
+    # Reverse to chronological order for the model. Only user/assistant
+    # plain-text turns are replayed — tool_call sequences from prior turns
+    # are intentionally dropped because we don't persist the tool result
+    # messages (they're transient), and feeding back tool_calls without
+    # their tool results would violate the OpenAI message contract.
+    rows.reverse()
+    history: list[dict[str, object]] = []
+    for row in rows:
+        if row.role not in ("user", "assistant"):
+            continue
+        history.append({"role": row.role, "content": row.content})
+    return history
+
+
+async def _persist_turn(
+    session: AsyncSession,
+    *,
+    session_id: str,
+    user_message: str,
+    assistant_reply: str,
+    tool_summaries: list[ToolCallSummary],
+) -> None:
+    """Append the user message and assistant reply (+ tool calls) to the table.
+
+    Tool result rows are not persisted individually — they're transient. The
+    assistant reply is the durable artifact. We do store the `tool_calls`
+    JSON on the assistant row so a future reload reconstructs the OpenAI
+    conversation shape if needed.
+    """
+    now = _now_iso()
+    session.add(
+        Conversation(
+            timestamp=now,
+            role="user",
+            content=user_message,
+            tool_calls=None,
+            session_id=session_id,
+        ),
+    )
+    tool_calls_json: str | None = None
+    if tool_summaries:
+        tool_calls_json = json.dumps(
+            [
+                {"name": t.name, "arguments": t.arguments, "ok": t.ok}
+                for t in tool_summaries
+            ],
+        )
+    session.add(
+        Conversation(
+            timestamp=_now_iso(),
+            role="assistant",
+            content=assistant_reply,
+            tool_calls=tool_calls_json,
+            session_id=session_id,
+        ),
+    )
+    await session.commit()
+
+
+@router.post("", response_model=ChatResponse)
+async def chat(
+    payload: ChatRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ChatResponse:
+    try:
+        history = await _load_history(session, payload.session_id)
+        result = await run_agent(
+            session, history=history, user_message=payload.message,
+        )
+    except DeepSeekAuthMissing as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "deepseek_unconfigured",
+                "message": "DEEPSEEK_API_KEY not set; chat is unavailable",
+                "details": str(exc),
+            },
+        ) from exc
+    except DeepSeekAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "deepseek_auth_failed",
+                "message": "DeepSeek rejected the API key",
+                "details": str(exc),
+            },
+        ) from exc
+    except DeepSeekUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "deepseek_unavailable",
+                "message": "DeepSeek transient error",
+                "details": str(exc),
+            },
+        ) from exc
+    except BudgetExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "budget_exceeded",
+                "message": (
+                    f"Daily {exc.kind} token budget spent ({exc.used}/{exc.cap}). "
+                    "Resets at local midnight."
+                ),
+                "kind": exc.kind,
+                "used": exc.used,
+                "cap": exc.cap,
+            },
+        ) from exc
+
+    tool_summaries = [
+        ToolCallSummary(
+            name=r.name, arguments=r.arguments, result=r.result, ok=r.ok,
+        )
+        for r in result.tool_calls
+    ]
+    await _persist_turn(
+        session,
+        session_id=payload.session_id,
+        user_message=payload.message,
+        assistant_reply=result.reply,
+        tool_summaries=tool_summaries,
+    )
+
+    return ChatResponse(
+        session_id=payload.session_id,
+        reply=result.reply,
+        tool_calls=tool_summaries,
+        actions_taken=result.actions_taken,
+        finish_reason=result.finish_reason,
+    )

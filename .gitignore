@@ -1,0 +1,56 @@
+# --- secrets / runtime data ---
+.env
+.env.*
+!.env.example
+data/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- integration credentials (belt-and-suspenders) ---
+**/credentials.json
+**/client_secret*.json
+**/token.json
+**/*token*.json
+**/google_token.json
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+.lattice/
+
+# --- derived / generated artifacts (not part of the app) ---
+graphify-out/
+
+# --- python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.python-version
+
+# --- node / svelte ---
+node_modules/
+.svelte-kit/
+.svelte-kit-cache/
+dist/
+build/
+.vite/
+
+# --- editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- uv ---
+# keep uv.lock committed (reproducible builds)

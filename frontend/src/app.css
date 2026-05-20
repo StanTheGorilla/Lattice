@@ -1,0 +1,127 @@
+@import 'tailwindcss';
+
+/* ============================================================
+   Lattice — design tokens
+   Calm dashboard: dark, soft borders, generous spacing, hero numbers.
+   ============================================================ */
+@theme {
+	--color-bg-0: #0b0b0e;
+	--color-bg-1: #131319;
+	--color-bg-2: #1a1a22;
+	--color-bg-3: #21212a;
+	--color-bg-inset: #0e0e12;
+	--color-border: #23232c;
+	--color-border-2: #1a1a22;
+	--color-border-strong: #2e2e38;
+	--color-fg: #ececf1;
+	--color-fg-mute: #a8a8b2;
+	--color-fg-dim: #6a6a76;
+	--color-fg-faint: #3f3f48;
+	--color-accent: #5dd0c8;
+	--color-accent-d: #3a8a85;
+	--color-ok: #6dbf7a;
+	--color-warn: #d4b15a;
+	--color-bad: #c96a6a;
+	--color-purple: #b39ddc;
+
+	--font-sans: 'Inter', 'Helvetica Neue', Arial, sans-serif;
+	--font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+	/* spacing scale */
+	--s-1: 4px;
+	--s-2: 8px;
+	--s-3: 12px;
+	--s-4: 16px;
+	--s-5: 20px;
+	--s-6: 24px;
+	--s-7: 32px;
+	--s-8: 48px;
+
+	/* radii */
+	--r-sm: 4px;
+	--r-md: 6px;
+	--r-lg: 10px;
+}
+
+:root {
+	color-scheme: dark;
+	--accent-12: rgba(93, 208, 200, 0.12);
+	--accent-20: rgba(93, 208, 200, 0.2);
+	--bad-12: rgba(201, 106, 106, 0.14);
+	--ok-12: rgba(109, 191, 122, 0.12);
+	--warn-12: rgba(212, 177, 90, 0.12);
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	min-height: 100%;
+	background: var(--color-bg-0);
+	color: var(--color-fg);
+	font-family: var(--font-sans);
+	font-size: 14px;
+	line-height: 1.5;
+	font-feature-settings: 'tnum' 1, 'cv11' 1, 'ss01' 1;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+button {
+	font: inherit;
+	color: inherit;
+	background: none;
+	border: 0;
+	padding: 0;
+	cursor: pointer;
+}
+
+input,
+select,
+textarea {
+	font: inherit;
+	color: inherit;
+}
+
+a {
+	color: inherit;
+	text-decoration: none;
+}
+
+::selection {
+	background: var(--accent-20);
+	color: var(--color-fg);
+}
+
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+::-webkit-scrollbar-thumb {
+	background: #25252e;
+	border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: #2e2e38;
+}
+
+/* very subtle vignette — replaces the noisy grid */
+body::before {
+	content: '';
+	position: fixed;
+	inset: 0;
+	pointer-events: none;
+	z-index: 0;
+	background: radial-gradient(
+		ellipse at top,
+		rgba(93, 208, 200, 0.04) 0%,
+		transparent 55%
+	);
+}
