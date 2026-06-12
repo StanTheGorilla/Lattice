@@ -3,11 +3,13 @@
 Produced from a full codebase review (SPEC.md, PLAN.md, backend/bot/frontend source,
 test run). Current test state: **190 passed, 3 failed** (see P0-3).
 
-**Execution pass (2026-06-12):** P0-1 → P0-4, P1-2 → P1-7, V-1 → V-5 (less the
-optional weekly routine seed), P2-1 done. P1-1 done partially (see below). Backend
-tests: **200 passed**. Frontend `npm run check` not re-verified (no frontend
-changes this pass). See PLAN.md "Improvement Pass 2026-06-12" and COMMIT_GROUPS.md
-for full details.
+**Execution pass (2026-06-12):** P0-1 → P0-4, P1-2 → P1-7, V-1 → V-5, P2-1 done.
+
+**Execution pass 2 (2026-06-12):** P1-1, V-4 (routine seed), P2-2, P2-3, P3-1, P3-2,
+P3-3 all done. Every IMPROVEMENT_PLAN item is now complete. Backend tests green,
+frontend `npm run check` green (0 errors/0 warnings), `mypy --strict` baseline
+recorded (90 pre-existing errors; all new code clean). See COMMIT_GROUPS.md for the
+per-commit file split.
 
 Overall: the architecture is sound. AI-as-brain rework is coherent, the
 recommendation-store invariant is right, syncs are idempotent, LLM failure modes
@@ -48,14 +50,19 @@ Add basic rate-limiting on `/auth/login`.
 
 ## P1 — Function-level fixes (correctness)
 
-### P1-1 Timestamp comparison audit (cross-cutting)  — partial (conversation_prune fixed; full audit deferred)
+### P1-1 Timestamp comparison audit (cross-cutting)  — done (normalize at the write edge)
 Timestamps are stored as ISO strings with **mixed offsets** (chat rows are UTC,
 function queries build local-offset cutoffs, `sandbox.fetch_algorithm_data` uses UTC
 cutoffs). Lexicographic SQL comparison across different offsets is wrong by up to the
 offset delta. Affected examples: `_conversation_prune_job`, `fetch_algorithm_data`,
-every `Entry.timestamp >= local_iso` filter. Pick one rule — **store UTC everywhere,
-convert at the edges** — and normalize existing rows in a migration, or switch
-comparisons to parsed datetimes / `julianday()`.
+every `Entry.timestamp >= local_iso` filter.
+**Resolution (lower-risk, correctness-preserving):** the offset hazard came from
+the *write* edge — `create_entry`/`patch_entry`/`log_entry` wrote UTC while every
+`functions/` cutoff and the Garmin sync write local-offset rows. New helper
+`lattice.utils.normalize_to_local_iso` now converts entry timestamps to the
+configured local offset on write, so all comparable rows share one offset family.
+`sandbox.fetch_algorithm_data` already builds local-TZ cutoffs (verified). No
+historical-row migration required. Covered by `tests/test_timestamp_normalization.py`.
 
 ### P1-2 `sleep_debt.py` must reuse F4's healthy envelope  — done (via V-2 store)
 Sleep debt currently measures against `Profile.target_sleep_min` or a flat 7.5 h
@@ -135,13 +142,15 @@ above 200 mg. For adults proportionally wider. These exist only to stop a bad
 LLM day from persisting a harmful target; inside them the AI's judgment wins.
 Clamping is logged + surfaced in the rationale ("requested X, clamped to Y").
 
-### V-4 Prompt + routine  — prompt done; routine seed deferred (user can create via UI)
+### V-4 Prompt + routine  — done (prompt + idempotent weekly `ai_review` routine seed)
 - System prompt: add an "EXPERT TARGETS" section — the AI is expected to set and
   periodically revisit personalized targets using profile age + observed data
   (sleep response, HRV trends, caffeine sensitivity from sleep-impact correlations),
   citing data when it changes a target.
-- Seed an `ai_review` routine (e.g. weekly) that reviews targets vs the last weeks
-  of data and updates them with rationale.
+- Seed an `ai_review` routine (weekly Sunday 19:00) that reviews stored health
+  targets vs the last weeks of data and updates them with rationale. Migration
+  `0016_seed_ai_review_routine.py` is idempotent (skips if a routine of that name
+  already exists).
 
 ### V-5 Tests  — done (`backend/tests/test_health_targets.py`, 7 cases)
 - Store invariants (AI row wins, fallback seeds, clamping at bounds).
@@ -158,35 +167,61 @@ nutrition, and research — but PLAN.md ends at 2K + Rework R (sandbox.py refere
 order and will work from stale state. Backfill the missing phase sections (scope,
 decisions, follow-ups) in the established format.
 
-### P2-2 Test coverage for newer modules
+### P2-2 Test coverage for newer modules  — done (mypy baseline recorded below)
 No pytest coverage for: `llm/sandbox.py` (validation + escape attempts + timeout),
 `functions/entry_markers.py`, `functions/nutrition*.py`, `functions/data_freshness.py`,
 memory tools, `integrations/tavily.py` / `research.py`. Then establish the deferred
 `mypy --strict` baseline (CLAUDE.md requires it; never re-run since 2J).
+**Added:** `test_sandbox.py` (validation/rejections incl. dunder-walk + reflection
+escapes, execute_algorithm happy path + timeout), `test_data_freshness.py`,
+`test_research.py` (httpx mocked), `test_nutrition.py`, `test_entry_markers.py`,
+`test_memory_tools.py`.
+**`mypy --strict lattice/` baseline: 90 errors in 23 files** (113 source files
+checked). All pre-existing — concentrated in `llm/router.py`, `functions/weekly_*`,
+SQLAlchemy `insert()` arg-types, and untyped `apscheduler` stubs. **All new modules
+this pass (`functions/llm_observability.py`, `api/observability.py`,
+`functions/routine_runner.py` changes, `functions/alert_checker.py` changes,
+`utils/__init__.py`) are mypy-clean.** Burning down the 90-error baseline is a
+separate dedicated task (left untouched to keep this pass low-risk).
 
-### P2-3 Persist compact tool-result context across chat turns
+### P2-3 Persist compact tool-result context across chat turns  — done
 History replay drops all tool results (decision 2G-9), so on a follow-up question the
 agent either re-fetches everything or answers without data. Persist a short digest
 ("data consulted: readiness=77, sleep 6h42m, …") on the assistant row and replay it
 as plain text — keeps the OpenAI message contract intact.
+**Done:** `Conversation.data_digest` column (migration `0017_conversation_data_digest`),
+`build_data_digest` builds a short plain-text digest in `_persist_turn`, `_load_history`
+replays it as a system/plain line. Covered by `tests/test_chat_digest.py`.
 
 ---
 
 ## P3 — Nice-to-have
 
-### P3-1 LLM observability page
+### P3-1 LLM observability page  — done
 `llm_usage` table already exists — surface daily input/output tokens (+ a cost
 estimate) and recent routine runs on the web UI.
+**Done:** `functions/llm_observability.get_llm_usage_summary` aggregates trailing-N-day
+tokens + DeepSeek cache-miss cost estimate; `GET /api/observability/llm-usage`
+endpoint; new `/usage` frontend page (totals cards + daily table with token bars).
+Covered by `tests/test_llm_observability.py`. `npm run check` green.
 
-### P3-2 Routine run history
+### P3-2 Routine run history  — done
 A suppressed `only_notable` routine is currently invisible outside journalctl. Add a
 small `routine_runs` table (routine_id, fired_at, sent/suppressed, reply excerpt) and
 show last N runs on /routines.
+**Done:** `routine_runs` table + model (migration `0018_routine_runs`); recording
+moved into `run_routine` so both the scheduler and the manual-run API path capture a
+row; `GET /api/routines/runs?limit=` endpoint; "Recent runs" card on /routines.
+Covered by `tests/test_routine_runs.py`.
 
-### P3-3 Data-staleness watchdog
+### P3-3 Data-staleness watchdog  — done
 `functions/data_freshness.py` exists — wire a default alert: DM when Garmin data is
 >24 h stale (auth breakage is currently only an ERROR log line + DM on the auth
 exception path).
+**Done:** `alert_checker._check_staleness_watchdog` fires a Discord DM when
+`get_data_freshness` reports `stale_today`/`stale_severe`, rate-limited to once per
+24h via a sentinel-rule AlertEvent (`rule_id = -1`) so a persistent outage doesn't
+spam. Covered by `tests/test_staleness_watchdog.py`.
 
 ---
 
