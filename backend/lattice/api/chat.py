@@ -63,13 +63,20 @@ async def _load_history(
     if they are still within the idle window; otherwise empty.
 
     Persisted as one DB row per message. We cap reload at chat_history_turns
-    rows — older context is fine to drop since the system prompt is rebuilt
-    each turn.
+    MESSAGES (rows) — i.e. the last N/2 exchanges (default 20 rows ≈ 10
+    exchanges). Older context is fine to drop since the system prompt is rebuilt
+    each turn and durable facts are kept in the user_memory table instead.
     """
+    # id is the tiebreaker: timestamps are second-resolution and the user +
+    # assistant rows of one turn are written back-to-back (same second) in
+    # _persist_turn. Without the id key, SQLite returns same-timestamp rows in
+    # an undefined order, so reverse() could place the assistant reply before
+    # the user message that prompted it — scrambling the dialogue and breaking
+    # follow-ups (the model can't tell which question a later "yes" answers).
     stmt = (
         select(Conversation)
         .where(Conversation.session_id == session_id)
-        .order_by(Conversation.timestamp.desc())
+        .order_by(Conversation.timestamp.desc(), Conversation.id.desc())
         .limit(settings.chat_history_turns)
     )
     rows = list((await session.execute(stmt)).scalars().all())

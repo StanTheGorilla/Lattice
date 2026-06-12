@@ -211,7 +211,7 @@ async def test_system_prompt_renders_with_context(db_session: AsyncSession) -> N
     assert "ACTIVE INITIATIVES" in prompt
     assert "OPEN DECISIONS" in prompt
     assert "USER-DEFINED RULES" in prompt
-    assert "ACTIVE PLANS" in prompt  # plans block baked in
+    assert "ACTIVE PROTOCOLS" in prompt  # plans block baked in
 
 
 # --------------------------------------------------------------------------- #
@@ -221,7 +221,7 @@ async def test_system_prompt_renders_with_context(db_session: AsyncSession) -> N
 
 @pytest.mark.asyncio
 async def test_f4_uses_profile_target_sleep_when_no_data(db_session: AsyncSession) -> None:
-    """Profile.target_sleep_min overrides the 7.5h hardcoded fallback."""
+    """Profile.target_sleep_min overrides the computed within-range base."""
     db_session.add(Profile(id=1, target_sleep_min=540, updated_at=_now()))  # 9h
     await db_session.commit()
 
@@ -229,7 +229,7 @@ async def test_f4_uses_profile_target_sleep_when_no_data(db_session: AsyncSessio
         db_session, target=date(2026, 5, 15), tz=TZ,
     )
     assert out.target_duration_min == 540.0
-    assert any("profile target" in f.lower() for f in out.flags)
+    assert any("configured target" in f.lower() for f in out.flags)
 
 
 @pytest.mark.asyncio

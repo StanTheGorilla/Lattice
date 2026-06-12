@@ -17,9 +17,11 @@ messages a human would see hitting the endpoint directly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -34,6 +36,7 @@ from lattice.config import settings
 from lattice.functions.advisor import compute_advisor
 from lattice.functions.allostatic_load import compute_allostatic_load
 from lattice.functions.changepoint import detect_changepoints
+from lattice.functions.data_freshness import get_data_freshness
 from lattice.functions.initiative_metrics import get_initiative_metrics
 from lattice.functions.lagged_correlate import compute_lagged_correlation
 from lattice.functions.recovery_trajectory import compute_recovery_trajectory
@@ -47,13 +50,17 @@ from lattice.functions.calendar_load import busy_hours_per_day
 from lattice.functions.habits_adherence import compute_habit_adherence
 from lattice.functions.quick_context import get_quick_context
 from lattice.functions.readiness import compute_readiness
+from lattice.functions.recommendation_store import (
+    get_active_sleep_recommendation,
+    set_sleep_recommendation,
+    tonight_target_date,
+)
 from lattice.functions.recovery import recovery_after
 from lattice.functions.sleep_pattern import (
     sleep_pattern,
     sleep_stages_for_night,
     sleep_stages_pattern,
 )
-from lattice.functions.sleep_window import compute_sleep_window
 from lattice.functions.stats import (
     body_battery_drop_rate,
     body_battery_hourly_deltas,
@@ -78,8 +85,18 @@ from lattice.llm.budget import check_budget, record_usage
 from lattice.llm.f9b_validator import enforce as f9b_enforce
 from lattice.llm.model_selector import pick_chat_model
 from lattice.llm.prompts import build_planning_context, build_system_prompt
+from lattice.llm.sandbox import execute_algorithm, fetch_algorithm_data, validate_code
 from lattice.llm.tools import TOOL_SCHEMAS
-from lattice.models import Entry, HabitCheckin, HabitDefinition, Metric
+from lattice.models import (
+    CalendarCache,
+    CustomAlgorithm,
+    DashboardCard,
+    Entry,
+    HabitCheckin,
+    HabitDefinition,
+    Metric,
+)
+from lattice.schemas.dashboard import DataSourceLineBar, DataSourceTable
 from lattice.schemas.entries import validate_data_for_type
 from lattice.sync.calendar_sync import (
     cached_events_or_refresh,
@@ -160,17 +177,19 @@ def _dump(obj: Any) -> Any:
 async def _h_get_today_overview(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
     tz = settings.timezone
     today = _today_local(tz)
+    freshness = await get_data_freshness(session)
     readiness = await compute_readiness(session, target=today, tz=tz)
     training = await compute_training_rec(
         session, target=today, tz=tz, readiness_score=readiness.score,
     )
-    sleep = await compute_sleep_window(session, target=today, tz=tz)
+    sleep = await get_active_sleep_recommendation(session, target=today, tz=tz)
     caffeine = await compute_caffeine_status(session, at=datetime.now(ZoneInfo(tz)), tz=tz)
     windows = await compute_work_windows(
         session, target=today, tz=tz, min_minutes=60, readiness_score=readiness.score,
     )
     return {
         "date": today.isoformat(),
+        "data_freshness": freshness,
         "readiness": _dump(readiness),
         "training_recommendation": _dump(training),
         "sleep_window": _dump(sleep),
@@ -178,6 +197,12 @@ async def _h_get_today_overview(session: AsyncSession, args: dict[str, Any]) -> 
         "top_work_window": _dump(windows.windows[0]) if windows.windows else None,
         "peak_focus_hour": windows.peak_focus_hour,
     }
+
+
+async def _h_check_data_freshness(
+    session: AsyncSession, args: dict[str, Any],
+) -> dict[str, Any]:
+    return await get_data_freshness(session)
 
 
 async def _h_get_readiness(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
@@ -224,7 +249,41 @@ async def _h_get_training_recommendation(
 async def _h_get_sleep_window(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
     tz = settings.timezone
     target = _parse_date(args.get("date"), tz)
-    return _dump(await compute_sleep_window(session, target=target, tz=tz))
+    return _dump(await get_active_sleep_recommendation(session, target=target, tz=tz))
+
+
+async def _h_set_sleep_recommendation(
+    session: AsyncSession, args: dict[str, Any],
+) -> dict[str, Any]:
+    tz = settings.timezone
+    raw_date = args.get("date")
+    target = _parse_date(raw_date, tz) if raw_date else tonight_target_date(tz)
+    bedtime = args.get("bedtime")
+    wake_time = args.get("wake_time")
+    if not isinstance(bedtime, str) or not bedtime.strip():
+        return _err("bedtime required (HH:MM local, or ISO 8601)")
+    if not isinstance(wake_time, str) or not wake_time.strip():
+        return _err("wake_time required (HH:MM local, or ISO 8601)")
+    dur_raw = args.get("target_duration_min")
+    try:
+        duration = float(dur_raw) if dur_raw is not None else None
+    except (TypeError, ValueError):
+        return _err("target_duration_min must be a number (minutes)")
+    rationale = args.get("rationale")
+    try:
+        rec = await set_sleep_recommendation(
+            session,
+            target=target,
+            tz=tz,
+            bedtime=bedtime.strip(),
+            wake_time=wake_time.strip(),
+            target_duration_min=duration,
+            rationale=rationale.strip() if isinstance(rationale, str) else None,
+            author="chat",
+        )
+    except (ValueError, KeyError) as exc:
+        return _err(f"could not parse times: {exc}")
+    return _dump(rec)
 
 
 async def _h_get_caffeine_status(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
@@ -581,6 +640,32 @@ async def _h_create_calendar_event(
     end = args.get("end")
     if not title or not start or not end:
         return _err("title, start, end are required")
+    # Cross-turn idempotency: if a cached event already has the same title and
+    # exact start/end, treat this as an accidental repeat (the model re-issuing
+    # a create it already made in a prior turn) and return the existing event
+    # instead of POSTing a duplicate to Google. The within-turn dedup handles
+    # parallel repeats in one turn; this covers the across-turn case.
+    existing = (
+        await session.execute(
+            select(CalendarCache).where(
+                CalendarCache.title == title,
+                CalendarCache.start == start,
+                CalendarCache.end == end,
+            ),
+        )
+    ).scalars().first()
+    if existing is not None:
+        return {
+            "id": existing.google_event_id,
+            "title": existing.title,
+            "start": existing.start,
+            "end": existing.end,
+            "is_all_day": bool(existing.is_all_day),
+            "note": (
+                "an identical event already exists at this time — returning it "
+                "instead of creating a duplicate"
+            ),
+        }
     body = row_to_event_body(
         title=title,
         start=start,
@@ -1208,6 +1293,549 @@ async def _h_list_plans(session: AsyncSession, args: dict[str, Any]) -> dict[str
     }
 
 
+_MAX_MEMORY_LEN = 500
+
+
+async def _h_remember(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import UserMemory
+
+    content = str(args.get("content") or "").strip()
+    if not content:
+        return _err("content (non-empty string) required")
+    if len(content) > _MAX_MEMORY_LEN:
+        return _err(f"content too long (max {_MAX_MEMORY_LEN} chars)")
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    row = UserMemory(content=content, created_at=now, updated_at=now)
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return {"id": row.id, "content": row.content}
+
+
+async def _h_update_memory(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import UserMemory
+
+    memory_id = args.get("id")
+    if not isinstance(memory_id, int):
+        return _err("id (int) required")
+    content = str(args.get("content") or "").strip()
+    if not content:
+        return _err("content (non-empty string) required")
+    if len(content) > _MAX_MEMORY_LEN:
+        return _err(f"content too long (max {_MAX_MEMORY_LEN} chars)")
+    row = await session.get(UserMemory, memory_id)
+    if row is None:
+        return _err(f"memory {memory_id} not found")
+    row.content = content
+    row.updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    await session.commit()
+    return {"id": memory_id, "content": content}
+
+
+async def _h_forget(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import UserMemory
+
+    memory_id = args.get("id")
+    if not isinstance(memory_id, int):
+        return _err("id (int) required")
+    row = await session.get(UserMemory, memory_id)
+    if row is None:
+        return _err(f"memory {memory_id} not found")
+    await session.delete(row)
+    await session.commit()
+    return {"forgot": memory_id}
+
+
+# --------------------------------------------------------------------------- #
+# Routine handlers (Phase B) — scheduled AI reviews + reminders
+# --------------------------------------------------------------------------- #
+
+
+def _routine_summary(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "type": row.type,
+        "time": f"{row.hour:02d}:{row.minute:02d}",
+        "weekday_mask": row.weekday_mask,
+        "chattiness": row.chattiness,
+        "enabled": row.enabled,
+        "instruction": row.instruction,
+        "reminder_text": row.reminder_text,
+        "last_run_at": row.last_run_at,
+    }
+
+
+async def _h_list_routines(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import Routine
+
+    rows = (
+        await session.execute(
+            select(Routine).order_by(Routine.hour.asc(), Routine.minute.asc())
+        )
+    ).scalars().all()
+    return {"count": len(rows), "items": [_routine_summary(r) for r in rows]}
+
+
+async def _h_create_routine(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from pydantic import ValidationError
+
+    from lattice.models import Routine
+    from lattice.schemas.routine import RoutineIn
+    from lattice.sync import scheduler
+
+    try:
+        payload = RoutineIn(**args)
+    except ValidationError as exc:
+        return _err(f"invalid routine: {exc.errors()[0]['msg'] if exc.errors() else exc}")
+
+    row = Routine(
+        name=payload.name.strip(),
+        type=payload.type,
+        hour=payload.hour,
+        minute=payload.minute,
+        weekday_mask=payload.weekday_mask,
+        instruction=(payload.instruction or None),
+        chattiness=payload.chattiness,
+        reminder_text=(payload.reminder_text or None),
+        enabled=payload.enabled,
+        last_run_at=None,
+        created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    await scheduler.reschedule(row.id)
+    return _routine_summary(row)
+
+
+async def _h_update_routine(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from pydantic import ValidationError
+
+    from lattice.models import Routine
+    from lattice.schemas.routine import RoutinePatch
+    from lattice.sync import scheduler
+
+    routine_id = args.get("id")
+    if not isinstance(routine_id, int):
+        return _err("id (int) required")
+    row = await session.get(Routine, routine_id)
+    if row is None:
+        return _err(f"routine {routine_id} not found")
+
+    fields = {k: v for k, v in args.items() if k != "id"}
+    try:
+        patch = RoutinePatch(**fields)
+    except ValidationError as exc:
+        return _err(f"invalid update: {exc.errors()[0]['msg'] if exc.errors() else exc}")
+
+    for attr, value in patch.model_dump(exclude_unset=True).items():
+        if attr == "name" and isinstance(value, str):
+            value = value.strip()
+        setattr(row, attr, value)
+
+    if row.type == "reminder" and not (row.reminder_text and row.reminder_text.strip()):
+        return _err("reminder routines require reminder_text")
+    if row.type == "ai_review" and not (row.instruction and row.instruction.strip()):
+        return _err("ai_review routines require instruction")
+
+    await session.commit()
+    await session.refresh(row)
+    await scheduler.reschedule(row.id)
+    return _routine_summary(row)
+
+
+async def _h_delete_routine(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import Routine
+    from lattice.sync import scheduler
+
+    routine_id = args.get("id")
+    if not isinstance(routine_id, int):
+        return _err("id (int) required")
+    row = await session.get(Routine, routine_id)
+    if row is None:
+        return _err(f"routine {routine_id} not found")
+    await session.delete(row)
+    await session.commit()
+    scheduler.remove_routine_job(routine_id)
+    return {"deleted": routine_id}
+
+
+# --------------------------------------------------------------------------- #
+# Alert rule handlers (Phase C)
+# --------------------------------------------------------------------------- #
+
+_ALERT_OPS = {"lt", "lte", "gt", "gte"}
+
+
+def _alert_summary(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "metric_name": row.metric_name,
+        "operator": row.operator,
+        "threshold": row.threshold,
+        "label": row.label,
+        "cooldown_hours": row.cooldown_hours,
+        "active": row.active,
+    }
+
+
+async def _h_list_alerts(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models.alert import AlertRule
+
+    rows = (
+        await session.execute(select(AlertRule).order_by(AlertRule.id))
+    ).scalars().all()
+    return {"count": len(rows), "items": [_alert_summary(r) for r in rows]}
+
+
+async def _h_create_alert(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models.alert import AlertRule
+
+    metric_name = str(args.get("metric_name", "")).strip()
+    operator = str(args.get("operator", "")).strip()
+    label = str(args.get("label", "")).strip()
+    if not metric_name:
+        return _err("metric_name required")
+    if operator not in _ALERT_OPS:
+        return _err(f"operator must be one of {sorted(_ALERT_OPS)}")
+    if not label:
+        return _err("label required")
+    try:
+        threshold = float(args["threshold"])
+    except (KeyError, TypeError, ValueError):
+        return _err("threshold (number) required")
+    cooldown_hours = args.get("cooldown_hours", 4)
+    if not isinstance(cooldown_hours, int) or cooldown_hours < 1:
+        return _err("cooldown_hours must be a positive integer")
+
+    row = AlertRule(
+        metric_name=metric_name,
+        operator=operator,
+        threshold=threshold,
+        label=label,
+        cooldown_hours=cooldown_hours,
+        active=True,
+        created_at=datetime.now(ZoneInfo(settings.timezone)).isoformat(),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return _alert_summary(row)
+
+
+async def _h_delete_alert(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models.alert import AlertRule
+
+    rule_id = args.get("id")
+    if not isinstance(rule_id, int):
+        return _err("id (int) required")
+    row = await session.get(AlertRule, rule_id)
+    if row is None:
+        return _err(f"alert {rule_id} not found")
+    await session.delete(row)
+    await session.commit()
+    return {"deleted": rule_id}
+
+
+# --------------------------------------------------------------------------- #
+# AI-authored algorithm handlers (Phase 2L-a)
+# --------------------------------------------------------------------------- #
+
+
+async def _h_create_algorithm(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    name = args.get("name", "")
+    description = args.get("description", "")
+    code = args.get("code", "")
+    data_requirements = args.get("data_requirements", {})
+    if not isinstance(name, str) or not name:
+        return _err("name is required (non-empty string)")
+    if not isinstance(description, str) or not description:
+        return _err("description is required")
+    if not isinstance(code, str) or not code:
+        return _err("code is required")
+    if not isinstance(data_requirements, dict):
+        return _err("data_requirements must be an object")
+    if not re.match(r"^[a-z][a-z0-9_]*$", name):
+        return _err("name must be snake_case (lowercase letters, digits, underscores; start with letter)")
+    try:
+        validate_code(code)
+    except ValueError as exc:
+        return _err(f"code validation failed: {exc}")
+    now = _now_iso()
+    dr_json = json.dumps(data_requirements)
+    stmt = sqlite_insert(CustomAlgorithm.__table__).values(
+        name=name,
+        description=description,
+        code=code,
+        data_requirements=dr_json,
+        created_at=now,
+        updated_at=now,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["name"],
+        set_={
+            "description": stmt.excluded.description,
+            "code": stmt.excluded.code,
+            "data_requirements": stmt.excluded.data_requirements,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    )
+    await session.execute(stmt)
+    await session.commit()
+    return {"name": name, "saved": True, "updated_at": now}
+
+
+async def _h_run_algorithm(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    name = args.get("name", "")
+    if not isinstance(name, str) or not name:
+        return _err("name is required")
+    row = (
+        await session.execute(select(CustomAlgorithm).where(CustomAlgorithm.name == name))
+    ).scalar_one_or_none()
+    if row is None:
+        return _err(f"algorithm '{name}' not found — use list_algorithms to see available ones")
+    try:
+        requirements = json.loads(row.data_requirements)
+    except json.JSONDecodeError:
+        return _err("stored data_requirements is invalid JSON")
+    try:
+        data = await fetch_algorithm_data(session, requirements)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"data fetch failed: {type(exc).__name__}: {exc}")
+    try:
+        result = await asyncio.to_thread(execute_algorithm, row.code, data)
+    except TimeoutError:
+        return _err("algorithm timed out (exceeded 5 seconds)")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"algorithm raised {type(exc).__name__}: {exc}")
+    return {"name": name, "result": result}
+
+
+async def _h_list_algorithms(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    rows = list(
+        (await session.execute(select(CustomAlgorithm).order_by(CustomAlgorithm.created_at.desc())))
+        .scalars()
+        .all()
+    )
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "name": r.name,
+                "description": r.description,
+                "data_requirements": json.loads(r.data_requirements),
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+            for r in rows
+        ],
+    }
+
+
+async def _h_delete_algorithm(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    name = args.get("name", "")
+    if not isinstance(name, str) or not name:
+        return _err("name is required")
+    row = (
+        await session.execute(select(CustomAlgorithm).where(CustomAlgorithm.name == name))
+    ).scalar_one_or_none()
+    if row is None:
+        return _err(f"algorithm '{name}' not found — use list_algorithms to see available ones")
+    await session.delete(row)
+    await session.commit()
+    return {"deleted": True, "name": name}
+
+
+def _summarise_card(card: DashboardCard) -> dict[str, Any]:
+    try:
+        spec = json.loads(card.data_source)
+    except (json.JSONDecodeError, TypeError):
+        spec = {}
+    return {
+        "id": card.id,
+        "title": card.title,
+        "chart_type": card.chart_type,
+        "position": card.position,
+        "data_source": spec,
+    }
+
+
+async def _h_list_dashboard_cards(
+    session: AsyncSession, _args: dict[str, Any],
+) -> dict[str, Any]:
+    rows = list((await session.execute(
+        select(DashboardCard).order_by(
+            DashboardCard.position.asc(), DashboardCard.id.asc(),
+        )
+    )).scalars().all())
+    return {"cards": [_summarise_card(r) for r in rows]}
+
+
+async def _h_update_dashboard_card(
+    session: AsyncSession, args: dict[str, Any],
+) -> dict[str, Any]:
+    card_id = args.get("card_id")
+    if not isinstance(card_id, int):
+        return _err("card_id (integer) is required")
+    card = (
+        await session.execute(
+            select(DashboardCard).where(DashboardCard.id == card_id)
+        )
+    ).scalar_one_or_none()
+    if card is None:
+        return _err(f"card {card_id} not found — list_dashboard_cards to see ids")
+
+    if "title" in args and args["title"]:
+        card.title = str(args["title"]).strip()
+
+    new_chart_type = args.get("chart_type") or card.chart_type
+    if new_chart_type not in ("line", "bar", "table"):
+        return _err("chart_type must be 'line', 'bar', or 'table'")
+
+    try:
+        existing_spec = json.loads(card.data_source)
+    except (json.JSONDecodeError, TypeError):
+        existing_spec = {}
+
+    if new_chart_type in ("line", "bar"):
+        merged = {
+            "days": args.get("days", existing_spec.get("days", 14)),
+            "series": args.get("series") or existing_spec.get("series") or [],
+        }
+        try:
+            spec_obj = DataSourceLineBar.model_validate(merged)
+        except ValidationError as exc:
+            return _err(f"invalid line/bar spec: {exc.errors()[0]['msg']}")
+        if not spec_obj.series:
+            return _err("series cannot be empty for line/bar charts")
+        for s in spec_obj.series:
+            if not s.metric and s.value is None:
+                return _err(
+                    f"series '{s.name}' must specify either 'metric' or 'value'"
+                )
+        new_spec_json = spec_obj.model_dump(exclude_none=True)
+    else:  # table
+        merged = {
+            "days": args.get("days", existing_spec.get("days", 7)),
+            "metric_columns": (
+                args.get("metric_columns")
+                or existing_spec.get("metric_columns")
+                or []
+            ),
+        }
+        try:
+            spec_obj_t = DataSourceTable.model_validate(merged)
+        except ValidationError as exc:
+            return _err(f"invalid table spec: {exc.errors()[0]['msg']}")
+        if not spec_obj_t.metric_columns:
+            return _err("metric_columns cannot be empty for table charts")
+        new_spec_json = spec_obj_t.model_dump(exclude_none=True)
+
+    card.chart_type = new_chart_type
+    card.data_source = json.dumps(new_spec_json)
+    await session.commit()
+    await session.refresh(card)
+    return {
+        "updated": True,
+        "card_id": card.id,
+        "title": card.title,
+        "chart_type": card.chart_type,
+        "message": f"Updated '{card.title}'.",
+    }
+
+
+async def _h_delete_dashboard_card(
+    session: AsyncSession, args: dict[str, Any],
+) -> dict[str, Any]:
+    card_id = args.get("card_id")
+    if not isinstance(card_id, int):
+        return _err("card_id (integer) is required")
+    card = (
+        await session.execute(
+            select(DashboardCard).where(DashboardCard.id == card_id)
+        )
+    ).scalar_one_or_none()
+    if card is None:
+        return _err(f"card {card_id} not found")
+    title = card.title
+    await session.delete(card)
+    await session.commit()
+    return {
+        "deleted": True,
+        "card_id": card_id,
+        "message": f"Removed '{title}' from the dashboard.",
+    }
+
+
+async def _h_render_chart(
+    session: AsyncSession, args: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist a DashboardCard. Resolves to live data on each dashboard load."""
+    chart_type = args.get("chart_type")
+    if chart_type not in ("line", "bar", "table"):
+        return _err("chart_type must be 'line', 'bar', or 'table'")
+    title = (args.get("title") or "").strip()
+    if not title:
+        return _err("title is required")
+
+    if chart_type in ("line", "bar"):
+        try:
+            spec_obj = DataSourceLineBar.model_validate({
+                "days": args.get("days", 14),
+                "series": args.get("series") or [],
+            })
+        except ValidationError as exc:
+            return _err(f"invalid line/bar spec: {exc.errors()[0]['msg']}")
+        if not spec_obj.series:
+            return _err("series (array) is required for line/bar charts")
+        for s in spec_obj.series:
+            if not s.metric and s.value is None:
+                return _err(
+                    f"series '{s.name}' must specify either 'metric' "
+                    "(to fetch values) or 'value' (constant line)"
+                )
+        spec_json = spec_obj.model_dump(exclude_none=True)
+    else:  # table
+        try:
+            spec_obj_t = DataSourceTable.model_validate({
+                "days": args.get("days", 7),
+                "metric_columns": args.get("metric_columns") or [],
+            })
+        except ValidationError as exc:
+            return _err(f"invalid table spec: {exc.errors()[0]['msg']}")
+        if not spec_obj_t.metric_columns:
+            return _err("metric_columns (array) is required for table charts")
+        spec_json = spec_obj_t.model_dump(exclude_none=True)
+
+    # Append at the end of the dashboard.
+    max_pos = (
+        await session.execute(select(func.max(DashboardCard.position)))
+    ).scalar()
+    next_pos = (max_pos or 0) + 1
+
+    card = DashboardCard(
+        title=title,
+        chart_type=chart_type,
+        data_source=json.dumps(spec_json),
+        position=next_pos,
+        created_at=_now_iso(),
+    )
+    session.add(card)
+    await session.commit()
+    await session.refresh(card)
+    return {
+        "saved": True,
+        "card_id": card.id,
+        "title": title,
+        "chart_type": chart_type,
+        "message": (
+            f"Saved '{title}' to the dashboard. It will refresh from live "
+            "data each time the user opens the Today page."
+        ),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch table
 # --------------------------------------------------------------------------- #
@@ -1215,11 +1843,13 @@ async def _h_list_plans(session: AsyncSession, args: dict[str, Any]) -> dict[str
 
 HANDLERS = {
     "get_today_overview": _h_get_today_overview,
+    "check_data_freshness": _h_check_data_freshness,
     "get_readiness": _h_get_readiness,
     "get_advice": _h_get_advice,
     "get_work_windows": _h_get_work_windows,
     "get_training_recommendation": _h_get_training_recommendation,
     "get_sleep_window": _h_get_sleep_window,
+    "set_sleep_recommendation": _h_set_sleep_recommendation,
     "get_caffeine_status": _h_get_caffeine_status,
     "get_metric": _h_get_metric,
     "get_baseline": _h_get_baseline,
@@ -1262,6 +1892,26 @@ HANDLERS = {
     "get_initiative_metrics": _h_get_initiative_metrics,
     "save_plan": _h_save_plan,
     "list_plans": _h_list_plans,
+    # --- persistent memory ---
+    "remember": _h_remember,
+    "update_memory": _h_update_memory,
+    "forget": _h_forget,
+    # --- routines (Phase B) ---
+    "list_routines": _h_list_routines,
+    "create_routine": _h_create_routine,
+    "update_routine": _h_update_routine,
+    "delete_routine": _h_delete_routine,
+    # --- alert rules (Phase C) ---
+    "list_alerts": _h_list_alerts,
+    "create_alert": _h_create_alert,
+    "delete_alert": _h_delete_alert,
+    # --- AI-authored algorithms (Phase 2L-a) ---
+    # NB: run_algorithm has no public schema — the model runs saved algorithms
+    # via the dynamically injected algo_{name} tools, which dispatch through
+    # _h_run_algorithm directly (see execute_tool). Exposing both was redundant.
+    "create_algorithm": _h_create_algorithm,
+    "list_algorithms": _h_list_algorithms,
+    "delete_algorithm": _h_delete_algorithm,
     # --- nutrition ---
     "analyze_food": _h_analyze_food,
     "get_daily_nutrition": _h_get_daily_nutrition,
@@ -1281,6 +1931,10 @@ HANDLERS = {
     "allostatic_load": _h_allostatic_load,
     "sleep_architecture": _h_sleep_architecture,
     "training_load_response": _h_training_load_response,
+    # --- dashboard cards (Phase 2L-c) ---
+    "list_dashboard_cards": _h_list_dashboard_cards,
+    "update_dashboard_card": _h_update_dashboard_card,
+    "delete_dashboard_card": _h_delete_dashboard_card,
 }
 
 WRITE_TOOLS = {
@@ -1289,18 +1943,59 @@ WRITE_TOOLS = {
     "patch_calendar_event", "delete_calendar_event",
     "sync_garmin", "sync_calendar",
     "save_plan", "save_research_paper",
-    "set_nutrition_goals",
+    "set_nutrition_goals", "set_sleep_recommendation",
+    "remember", "update_memory", "forget",
+    "create_routine", "update_routine", "delete_routine",
+    "create_alert", "delete_alert",
+    "create_algorithm",
+    "delete_algorithm",
+    "render_chart", "update_dashboard_card", "delete_dashboard_card",
 }
+
+# Write tools where an identical repeated call within ONE turn can be the user's
+# genuine intent (e.g. "log two coffees" → two identical log_entry calls). These
+# are exempt from the within-turn duplicate-call guard. Every other write tool is
+# idempotent or should never run twice with identical args in a single turn, so a
+# repeat is treated as a model mistake (the dominant cause of duplicate calendar
+# events: the model emitting create_calendar_event twice in parallel).
+_DEDUP_EXEMPT_WRITES = {"log_entry"}
+
+
+def _write_signature(name: str, args: dict[str, Any]) -> str:
+    return name + ":" + json.dumps(args, sort_keys=True, default=str)
 
 
 async def execute_tool(
-    session: AsyncSession, name: str, args: dict[str, Any],
+    session: AsyncSession,
+    name: str,
+    args: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
     """Dispatch a tool call. Returns (result, ok).
 
     Exceptions are caught and returned as `{error: ...}` so a misbehaving tool
     never crashes the agent loop — the LLM sees the error and can correct.
     """
+    # render_chart — persists to dashboard_cards (no inline visual)
+    if name == "render_chart":
+        try:
+            result = await _h_render_chart(session, args)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tool render_chart failed: %s", exc, exc_info=True)
+            return _err(f"{type(exc).__name__}: {exc}"), False
+        ok = "error" not in (result or {})
+        return result, ok
+
+    # algo_* — dynamically injected algorithm tools
+    if name.startswith("algo_"):
+        algo_name = name[5:]
+        try:
+            result = await _h_run_algorithm(session, {"name": algo_name})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tool %s failed: %s", name, exc, exc_info=True)
+            return _err(f"{type(exc).__name__}: {exc}"), False
+        ok = "error" not in (result or {})
+        return result, ok
+
     handler = HANDLERS.get(name)
     if handler is None:
         return _err(f"unknown tool: {name}"), False
@@ -1332,6 +2027,34 @@ async def run_agent(
     """
     iters = max_iters or settings.chat_max_iterations
     planning_ctx = await build_planning_context(session)
+
+    # Load saved algorithms and inject them as dynamic tools
+    algo_rows: list[CustomAlgorithm] = []
+    try:
+        algo_rows = list(
+            (await session.execute(
+                select(CustomAlgorithm).order_by(CustomAlgorithm.name.asc())
+            )).scalars().all()
+        )
+    except Exception:  # noqa: BLE001 — defensive; table may not exist yet
+        algo_rows = []
+    algo_schemas: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"algo_{r.name}",
+                "description": f"[Saved algorithm] {r.description}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        }
+        for r in algo_rows
+    ]
+    all_tools = TOOL_SCHEMAS + algo_schemas
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt(planning_context=planning_ctx)},
         *history,
@@ -1339,12 +2062,16 @@ async def run_agent(
     ]
     tool_records: list[ToolCallRecord] = []
     actions: list[str] = []
+    # Signatures of write tool calls already executed this turn — see
+    # _DEDUP_EXEMPT_WRITES. Maps signature → prior result so a duplicate call
+    # returns the same result without re-executing (prevents duplicate events).
+    executed_writes: dict[str, dict[str, Any]] = {}
     await check_budget(session)
 
     for _ in range(iters):
         completion = await chat_completion(
             messages=messages,
-            tools=TOOL_SCHEMAS,
+            tools=all_tools,
             model=pick_chat_model(user_message),
         )
         await record_usage(session, completion)
@@ -1388,12 +2115,38 @@ async def run_agent(
                 args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
             except json.JSONDecodeError:
                 args = {}
+
+            # Guard against duplicate writes within this turn (e.g. the model
+            # emitting create_calendar_event twice in parallel). Return the
+            # prior result instead of executing again so we don't create a
+            # second event / row. log_entry is exempt — repeats can be intended.
+            sig: str | None = None
+            if name in WRITE_TOOLS and name not in _DEDUP_EXEMPT_WRITES:
+                sig = _write_signature(name, args)
+                if sig in executed_writes:
+                    result = {
+                        **executed_writes[sig],
+                        "note": "duplicate call in the same turn ignored — "
+                        "this action was already performed; do not repeat it",
+                    }
+                    tool_records.append(
+                        ToolCallRecord(name=name, arguments=args, result=result, ok=True),
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result, default=str),
+                    })
+                    continue
+
             result, ok = await execute_tool(session, name, args)
             tool_records.append(
                 ToolCallRecord(name=name, arguments=args, result=result, ok=ok),
             )
             if ok and name in WRITE_TOOLS:
                 actions.append(name)
+                if sig is not None:
+                    executed_writes[sig] = result
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,

@@ -8,22 +8,26 @@ from typing import Any
 
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from lattice.api import (
     alerts,
+    algorithms,
     auth,
     calendar,
     chat,
+    dashboard,
     entries,
     functions,
     habits,
     health,
+    memory,
     metrics,
     nutrition,
     planning,
     reports,
     research,
+    routines,
     sync,
 )
 from lattice.config import configure_logging, settings
@@ -41,6 +45,7 @@ async def lifespan(_: FastAPI) -> Any:
         "disabled" if settings.lattice_disable_scheduler else "enabled",
     )
     scheduler.start()
+    await scheduler.load_routines()
     yield
     scheduler.shutdown()
     logger.info("lattice backend stopping")
@@ -61,11 +66,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/", response_class=PlainTextResponse, include_in_schema=False)
-async def root() -> str:
-    return (
-        "LATTICE backend — API only.\n"
-        "Open the UI at http://localhost:5173\n"
+@app.get("/", include_in_schema=False)
+async def root() -> Response:
+    index = settings.frontend_dist / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    return PlainTextResponse(
+        "LATTICE backend — API only (no frontend build found).\n"
+        "Run `npm run build` in frontend/, or open the dev UI at http://localhost:5173\n"
         "Health: /api/health · Docs: /docs\n"
     )
 
@@ -91,3 +99,23 @@ app.include_router(planning.router, prefix="/api")
 app.include_router(nutrition.router, prefix="/api")
 app.include_router(research.router, prefix="/api")
 app.include_router(alerts.router, prefix="/api")
+app.include_router(memory.router, prefix="/api")
+app.include_router(algorithms.router, prefix="/api")
+app.include_router(dashboard.router, prefix="/api")
+app.include_router(routines.router, prefix="/api")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa(full_path: str) -> Response:
+    """Serve static build files; fall back to index.html for client-side routes.
+
+    Registered after all /api routers and FastAPI's docs, so those take precedence.
+    """
+    dist = settings.frontend_dist.resolve()
+    candidate = (dist / full_path).resolve()
+    if full_path and candidate.is_file() and candidate.is_relative_to(dist):
+        return FileResponse(candidate)
+    index = settings.frontend_dist / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    return PlainTextResponse("Not found", status_code=404)

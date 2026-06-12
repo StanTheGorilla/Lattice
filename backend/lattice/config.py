@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     deepseek_timeout_s: float = Field(default=180.0, alias="LATTICE_DEEPSEEK_TIMEOUT_S")
     user_name: str = Field(default="Stan", alias="LATTICE_USER_NAME")
     chat_max_iterations: int = Field(default=25, alias="LATTICE_CHAT_MAX_ITERATIONS")
+    # Max prior conversation MESSAGES (rows) replayed to the model per turn.
+    # One exchange = 2 messages (user + assistant), so 20 ≈ the last 10 exchanges.
+    # Older context is dropped on purpose; durable facts live in user_memory instead.
     chat_history_turns: int = Field(default=20, alias="LATTICE_CHAT_HISTORY_TURNS")
     chat_session_idle_minutes: int = Field(default=30, alias="LATTICE_CHAT_SESSION_IDLE_MIN")
     daily_token_budget_input: int = Field(default=1_000_000_000, alias="LATTICE_DAILY_TOKEN_BUDGET_INPUT")
@@ -65,6 +68,11 @@ class Settings(BaseSettings):
     # research agent
     tavily_api_key: str | None = Field(default=None, alias="TAVILY_API_KEY")
     research_dir: str = Field(default="data/research", alias="LATTICE_RESEARCH_DIR")
+
+    @property
+    def frontend_dist(self) -> Path:
+        """Static SvelteKit build dir, served by FastAPI in production."""
+        return REPO_ROOT / "frontend" / "build"
 
     @property
     def database_url(self) -> str:

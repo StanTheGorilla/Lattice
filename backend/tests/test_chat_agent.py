@@ -130,6 +130,100 @@ async def test_iteration_cap_breaks_runaway_loops(db_session: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_write_calls_in_one_turn_are_deduped(db_session: Any) -> None:
+    """Two identical non-exempt write calls in one assistant turn run once.
+
+    Mirrors the model emitting create_calendar_event twice in parallel (the
+    duplicate-event bug). `remember` stands in for it here — it's a write tool
+    that touches only the DB, so it needs no external mock.
+    """
+    from lattice.models import UserMemory
+
+    script = _Script([
+        _completion(_msg(tool_calls=[
+            _tc("remember", {"content": "prefers metric units"}, tc_id="call_a"),
+            _tc("remember", {"content": "prefers metric units"}, tc_id="call_b"),
+        ])),
+        _completion(_msg(content="Saved.")),
+    ])
+    with patch.object(llm_router, "chat_completion", new=script):
+        result = await llm_router.run_agent(
+            db_session, history=[], user_message="remember I prefer metric units",
+        )
+
+    rows = (await db_session.execute(select(UserMemory))).scalars().all()
+    assert len(rows) == 1  # only one row despite two identical calls
+    assert result.actions_taken == ["remember"]  # deduped call is not re-counted
+    # Both tool calls still get a result (OpenAI contract: one tool msg per id);
+    # the second is flagged as a duplicate.
+    assert len(result.tool_calls) == 2
+    assert "duplicate call" in result.tool_calls[1].result.get("note", "")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_log_entry_in_one_turn_is_not_deduped(db_session: Any) -> None:
+    """log_entry is exempt — "log two coffees" legitimately repeats the call."""
+    script = _Script([
+        _completion(_msg(tool_calls=[
+            _tc("log_entry", {"type": "drink", "data": {"kind": "coffee", "count": 1}}, tc_id="c1"),
+            _tc("log_entry", {"type": "drink", "data": {"kind": "coffee", "count": 1}}, tc_id="c2"),
+        ])),
+        _completion(_msg(content="Logged 2 coffees.")),
+    ])
+    with patch.object(llm_router, "chat_completion", new=script):
+        result = await llm_router.run_agent(
+            db_session, history=[], user_message="log two coffees",
+        )
+
+    rows = (await db_session.execute(select(Entry))).scalars().all()
+    assert len(rows) == 2
+    assert result.actions_taken == ["log_entry", "log_entry"]
+
+
+@pytest.mark.asyncio
+async def test_create_calendar_event_is_idempotent_across_turns(db_session: Any) -> None:
+    """A create matching an existing cached event returns it, not a duplicate.
+
+    Seeds one CalendarCache row, then has the model issue create_calendar_event
+    with the same title/start/end. The handler short-circuits before any Google
+    call, so no client mock is needed; it must return the existing event flagged
+    as already-present and must NOT add a second cache row.
+    """
+    from lattice.models import CalendarCache
+
+    db_session.add(
+        CalendarCache(
+            google_event_id="evt_existing",
+            title="Dentist",
+            start="2026-06-01T09:00:00+02:00",
+            end="2026-06-01T09:30:00+02:00",
+            is_all_day=0,
+            fetched_at="2026-05-30T20:00:00+02:00",
+        ),
+    )
+    await db_session.commit()
+
+    script = _Script([
+        _completion(_msg(tool_calls=[_tc("create_calendar_event", {
+            "title": "Dentist",
+            "start": "2026-06-01T09:00:00+02:00",
+            "end": "2026-06-01T09:30:00+02:00",
+        })])),
+        _completion(_msg(content="That event already exists.")),
+    ])
+    with patch.object(llm_router, "chat_completion", new=script):
+        result = await llm_router.run_agent(
+            db_session, history=[], user_message="add a dentist appointment",
+        )
+
+    rows = (await db_session.execute(select(CalendarCache))).scalars().all()
+    assert len(rows) == 1  # no duplicate row created
+    assert result.tool_calls[0].ok is True
+    assert "identical event already exists" in result.tool_calls[0].result.get("note", "")
+    assert result.tool_calls[0].result["id"] == "evt_existing"
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_name_surfaces_as_error(db_session: Any) -> None:
     script = _Script([
         _completion(_msg(tool_calls=[_tc("nope", {})])),

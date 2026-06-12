@@ -1,4 +1,10 @@
-"""Chat endpoint schemas (SPEC §5.6)."""
+"""Chat endpoint schemas (SPEC §5.6).
+
+Visual rendering moved to dashboard cards in Phase 2L-c — the chat agent's
+`render_chart` tool persists to the `dashboard_cards` table; the web UI
+loads them from `/api/dashboard/cards`. The chat response itself is now
+text + tool-call metadata only.
+"""
 
 from __future__ import annotations
 

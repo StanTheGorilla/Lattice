@@ -192,6 +192,31 @@ async def _cached_window(
 # --------------------------------------------------------------------------- #
 
 
+async def _reconcile_deletions(
+    session: AsyncSession,
+    time_min: str,
+    time_max: str,
+    present_ids: set[str],
+) -> int:
+    """Drop cache rows overlapping the window that Google no longer returns.
+
+    Google `list_events` returns every event overlapping [time_min, time_max];
+    so does our cache query. Any overlapping cached row absent from the fresh
+    fetch was deleted in Google directly (not via our write-through path) and
+    would otherwise linger forever, since `_upsert` only ever inserts/updates.
+    Mirrors the overlap predicate of `_cached_window` so we only prune inside
+    the synced window. An empty `present_ids` means the window is now empty in
+    Google → drop every overlapping row.
+    """
+    overlap = and_(CalendarCache.end >= time_min, CalendarCache.start <= time_max)
+    stmt = delete(CalendarCache).where(overlap)
+    if present_ids:
+        stmt = stmt.where(CalendarCache.google_event_id.notin_(present_ids))
+    result = await session.execute(stmt)
+    await session.commit()
+    return int(result.rowcount or 0)
+
+
 async def sync_window(
     session: AsyncSession,
     time_min: str,
@@ -199,7 +224,8 @@ async def sync_window(
     *,
     client: GoogleCalendarClient | None = None,
 ) -> int:
-    """Fetch [time_min, time_max] from Google and UPSERT into cache.
+    """Fetch [time_min, time_max] from Google, UPSERT present events, and drop
+    cache rows for events deleted in Google.
 
     Returns the number of rows written.
     """
@@ -207,8 +233,12 @@ async def sync_window(
     events = await client.list_events(time_min=time_min, time_max=time_max)
     rows = [r for r in (event_to_row(e) for e in events) if r is not None]
     written = await _upsert(session, rows, _now_iso())
+    removed = await _reconcile_deletions(
+        session, time_min, time_max, {r.google_event_id for r in rows},
+    )
     logger.info(
-        "calendar sync_window %s..%s — %d events written", time_min, time_max, written,
+        "calendar sync_window %s..%s — %d written, %d removed",
+        time_min, time_max, written, removed,
     )
     return written
 

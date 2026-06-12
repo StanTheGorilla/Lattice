@@ -39,7 +39,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Bundled snapshot of today's state: readiness (F1), training rec (F3), "
                 "sleep window (F4), caffeine status (F5), and the top work window (F2). "
-                "Use as the first call when the user asks 'how am I today' or similar."
+                "Use as the first call when the user asks 'how am I today' or similar. "
+                "Includes a `data_freshness` block — always check it before quoting "
+                "'today's' or 'last night's' numbers; if it reports stale data, the "
+                "user's Garmin watch likely has not synced to the Garmin Connect app yet."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_data_freshness",
+            "description": (
+                "Check whether the Garmin data in the database actually covers "
+                "last night and the current intra-day window. Returns: latest "
+                "sleep wake date, nights behind today, hours since the latest "
+                "daily metric, hours since the latest intra-day sample, a "
+                "status (fresh | stale_today | stale_intraday | stale_severe), "
+                "and an advisory string. "
+                "Call this BEFORE answering ANY question about 'today', 'last "
+                "night', 'current', or 'right now'. If status != 'fresh', say "
+                "so explicitly in the reply and tell the user to open the "
+                "Garmin Connect phone app to sync — do not present stale rows "
+                "as if they reflected last night."
             ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
@@ -112,10 +135,55 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_sleep_window",
-            "description": "F4 — bedtime and wake_time derived from tomorrow's first event.",
+            "description": (
+                "The stored sleep recommendation for a date — the AI's own decision "
+                "if one has been set (source='ai'), otherwise the F4 formula seed "
+                "(source='formula'). This is the SAME value the website Today page "
+                "and the evening Discord brief show. Returns bedtime, wake_time, "
+                "target_duration_min, source, rationale."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"date": _DATE_PARAM},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_sleep_recommendation",
+            "description": (
+                "Persist YOUR concluded bedtime/wake as the single source of truth. "
+                "Once you reason past the raw F4 formula (weighing the calendar, what "
+                "the user told you, recovery), call this so the website and the evening "
+                "brief show the SAME numbers you gave in chat — otherwise they print raw "
+                "F4 and contradict you. Overwrites any prior recommendation for the date. "
+                "Pass local times as 'HH:MM' (bedtime in the evening, wake the next "
+                "morning) or full ISO 8601. Include a one-line rationale."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bedtime": {
+                        "type": "string",
+                        "description": "Target bedtime, 'HH:MM' local (e.g. '23:15') or ISO 8601.",
+                    },
+                    "wake_time": {
+                        "type": "string",
+                        "description": "Target wake time, 'HH:MM' local (e.g. '07:00') or ISO 8601.",
+                    },
+                    "target_duration_min": {
+                        "type": "number",
+                        "description": "Optional sleep target in minutes; computed from bedtime→wake if omitted.",
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "One sentence on why — shown next to the recommendation on the website.",
+                    },
+                    "date": _DATE_PARAM,
+                },
+                "required": ["bedtime", "wake_time"],
                 "additionalProperties": False,
             },
         },
@@ -1435,6 +1503,501 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "Window for the output series in days (default 60).",
                     },
                 },
+                "additionalProperties": False,
+            },
+        },
+    },
+    # ---- persistent memory ----
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Save a small, durable fact about the USER for future conversations — "
+                "stable preferences, personal context, goals, or decisions they tell you "
+                "(e.g. 'prefers morning workouts', 'is training for a marathon in October'). "
+                "These persist across sessions and are shown to you in the PERSISTENT MEMORY "
+                "section every turn. Keep each entry short and specific. "
+                "Do NOT store biometric/metric values, calendar contents, or anything "
+                "queryable via a data tool — those change and must always be re-fetched. "
+                "Before adding, check PERSISTENT MEMORY for a similar entry and use "
+                "update_memory instead of creating a duplicate."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The fact to remember (plain text, max 500 chars).",
+                    },
+                },
+                "required": ["content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_memory",
+            "description": (
+                "Revise an existing memory entry when a fact changed or to consolidate "
+                "duplicates. Use the [id] shown next to the entry in PERSISTENT MEMORY."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The memory entry id."},
+                    "content": {
+                        "type": "string",
+                        "description": "The new content (plain text, max 500 chars).",
+                    },
+                },
+                "required": ["id", "content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": (
+                "Delete a memory entry that is wrong or no longer true. Use the [id] "
+                "shown next to the entry in PERSISTENT MEMORY."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The memory entry id."},
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # ---- routines (Phase B) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "list_routines",
+            "description": (
+                "List the user's scheduled routines (their id, name, time, weekday "
+                "mask, type, chattiness, enabled state). Routines replace the old "
+                "fixed briefs: each is either an 'ai_review' (you are run with an "
+                "instruction at the scheduled time and your reply is DMed) or a "
+                "'reminder' (fixed text is DMed). Call this before update/delete so "
+                "you have the right id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_routine",
+            "description": (
+                "Create a scheduled routine. Use 'ai_review' when the user wants a "
+                "recurring check-in where YOU analyse data and message them (e.g. "
+                "'review my recovery every morning and ping me if it dips') — put "
+                "what to do in `instruction`. Use 'reminder' for a fixed recurring "
+                "message (e.g. 'remind me to stretch at 18:00') — put the text in "
+                "`reminder_text`. Set chattiness='only_notable' to stay silent unless "
+                "something crosses a notability bar (only meaningful for ai_review); "
+                "'always' messages every run. Times are local 24h. `weekday_mask` is "
+                "a 7-bit integer, bit 0=Monday … bit 6=Sunday (127=every day, "
+                "62=Mon–Fri, 96=weekend)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short label for the routine."},
+                    "type": {
+                        "type": "string",
+                        "enum": ["ai_review", "reminder"],
+                        "description": "ai_review = you analyse + message; reminder = fixed text.",
+                    },
+                    "hour": {"type": "integer", "description": "Local hour 0–23."},
+                    "minute": {"type": "integer", "description": "Local minute 0–59."},
+                    "weekday_mask": {
+                        "type": "integer",
+                        "description": "7-bit day mask (bit0=Mon…bit6=Sun). Default 127 = every day.",
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "For ai_review: what to analyse and report.",
+                    },
+                    "chattiness": {
+                        "type": "string",
+                        "enum": ["always", "only_notable"],
+                        "description": "only_notable = silent unless something is notable.",
+                    },
+                    "reminder_text": {
+                        "type": "string",
+                        "description": "For reminder: the exact message to DM.",
+                    },
+                },
+                "required": ["name", "type", "hour", "minute"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_routine",
+            "description": (
+                "Edit an existing routine. Pass its [id] (from list_routines) plus "
+                "only the fields to change — e.g. move the time, flip enabled, switch "
+                "chattiness, or rewrite the instruction/reminder_text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The routine id."},
+                    "name": {"type": "string"},
+                    "type": {"type": "string", "enum": ["ai_review", "reminder"]},
+                    "hour": {"type": "integer"},
+                    "minute": {"type": "integer"},
+                    "weekday_mask": {"type": "integer"},
+                    "instruction": {"type": "string"},
+                    "chattiness": {"type": "string", "enum": ["always", "only_notable"]},
+                    "reminder_text": {"type": "string"},
+                    "enabled": {"type": "boolean"},
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_routine",
+            "description": "Delete a routine by its [id] (from list_routines).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The routine id."},
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # ---- Alert rules (Phase C) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "list_alerts",
+            "description": (
+                "List the user's proactive alert rules. Each rule watches one metric "
+                "and DMs the user when it crosses a threshold (checked hourly)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_alert",
+            "description": (
+                "Create a proactive alert rule that DMs the user when a metric crosses "
+                "a threshold. Checked hourly; respects a per-rule cooldown so it won't "
+                "spam. Use for requests like 'tell me if my HRV drops below 40' or "
+                "'ping me when body battery is under 20'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric_name": {
+                        "type": "string",
+                        "description": (
+                            "The metric to watch, e.g. 'hrv', 'rhr', 'body_battery', "
+                            "'stress', 'sleep_score'. Matches the metrics table name."
+                        ),
+                    },
+                    "operator": {
+                        "type": "string",
+                        "enum": ["lt", "lte", "gt", "gte"],
+                        "description": "Comparison: lt=<, lte=≤, gt=>, gte=≥.",
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "The value to compare the latest metric against.",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-readable name shown in the alert DM.",
+                    },
+                    "cooldown_hours": {
+                        "type": "integer",
+                        "description": "Min hours between repeat fires of this rule. Default 4.",
+                    },
+                },
+                "required": ["metric_name", "operator", "threshold", "label"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_alert",
+            "description": "Delete an alert rule by its [id] (from list_alerts).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The alert rule id."},
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # ---- AI-authored algorithms (Phase 2L-a) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "create_algorithm",
+            "description": (
+                "Save a Python algorithm to the database for reuse across sessions. "
+                "The code MUST define `def run(data): ...` where `data` is a dict "
+                "injected by the backend from `data_requirements`. "
+                "No imports allowed — use math, statistics, and built-in operations only. "
+                "Use this when you compute the same derivation repeatedly across turns. "
+                "Upserts by name — same name replaces old code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Short snake_case identifier, e.g. 'sleep_deficit_14d'. "
+                            "Becomes available as tool algo_{name} in future sessions."
+                        ),
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "One sentence describing what this algorithm computes.",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Python source containing `def run(data): ...`. "
+                            "data keys come from data_requirements (e.g. data['sleep_hours']). "
+                            "No imports. Available: math, statistics, all standard builtins."
+                        ),
+                    },
+                    "data_requirements": {
+                        "type": "object",
+                        "description": (
+                            "Declares what data to auto-inject as `data` argument. "
+                            'Example: {"metrics": [{"name": "sleep_hours", "days": 14}], '
+                            '"entries": [{"type": "drink", "days": 7}], '
+                            '"calendar": {"days": 7}}'
+                        ),
+                    },
+                },
+                "required": ["name", "description", "code", "data_requirements"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_algorithms",
+            "description": (
+                "List all saved algorithms: name, description, data_requirements, "
+                "created_at. Use to audit your library before creating a duplicate."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_algorithm",
+            "description": (
+                "Permanently delete a saved algorithm by name. "
+                "Use when an algorithm is wrong, obsolete, or replaced by a better one. "
+                "To update an algorithm, call create_algorithm with the same name instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Algorithm name (snake_case, without the algo_ prefix).",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # ---- Dashboard cards (Phase 2L-c) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "render_chart",
+            "description": (
+                "Save a persistent chart card to the user's web dashboard ('Today' page). "
+                "The card auto-refreshes from live metric data every time the user opens the "
+                "dashboard — you store the recipe, not a snapshot. Returns the saved card id. "
+                "After saving, briefly tell the user the card is on their dashboard.\n\n"
+                "For line/bar: provide `days` (trailing window) and `series`. Each series "
+                "either references a metric_name (auto-fetched daily values) or a constant "
+                "`value` (renders as a horizontal reference line).\n\n"
+                "For table: provide `days` and `metric_columns` (one column per metric, one "
+                "row per day in the window).\n\n"
+                "Use exact metric names from the metrics table (e.g. 'sleep_duration_min', "
+                "'sleep_score', 'hrv_overnight_avg', 'resting_hr', 'body_battery_start', "
+                "'stress_avg', 'readiness_score')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chart_type": {
+                        "type": "string",
+                        "enum": ["line", "bar", "table"],
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Card title shown in the dashboard. Keep it short.",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 365,
+                        "description": "Trailing window length in days. Default 14 for line/bar, 7 for table.",
+                    },
+                    "series": {
+                        "type": "array",
+                        "description": "Required for line/bar. Each item is one series.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "metric": {
+                                    "type": "string",
+                                    "description": "Metric name to fetch (e.g. 'sleep_duration_min').",
+                                },
+                                "value": {
+                                    "type": "number",
+                                    "description": "Constant value — renders as a horizontal reference line.",
+                                },
+                                "color": {
+                                    "type": "string",
+                                    "description": "Optional hex color, e.g. '#5dd0c8'.",
+                                },
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                    "metric_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Required for table — list of metric names, one column per metric.",
+                    },
+                },
+                "required": ["chart_type", "title"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dashboard_cards",
+            "description": (
+                "List the user's current dashboard cards (id, title, chart_type, data_source). "
+                "Call this BEFORE update_dashboard_card or delete_dashboard_card so you know "
+                "which card_id corresponds to which card the user is referring to."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_dashboard_card",
+            "description": (
+                "Modify an existing dashboard card. Provide only the fields you want to "
+                "change — omitted fields are kept as-is. To find the card_id, call "
+                "list_dashboard_cards first. The chart auto-refreshes from live data each "
+                "time the user opens the dashboard, so editing the spec changes future "
+                "rendering immediately."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "card_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "chart_type": {"type": "string", "enum": ["line", "bar", "table"]},
+                    "days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 365,
+                    },
+                    "series": {
+                        "type": "array",
+                        "description": "Replaces series wholesale when provided. Used by line/bar.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "metric": {"type": "string"},
+                                "value": {"type": "number"},
+                                "color": {"type": "string"},
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                    "metric_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Replaces table columns when provided.",
+                    },
+                },
+                "required": ["card_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_dashboard_card",
+            "description": (
+                "Remove a card from the user's dashboard. Use list_dashboard_cards first "
+                "to find the card_id. Only call this when the user explicitly asks to "
+                "delete a chart."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "card_id": {"type": "integer"},
+                },
+                "required": ["card_id"],
                 "additionalProperties": False,
             },
         },

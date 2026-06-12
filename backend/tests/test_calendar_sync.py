@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from lattice.sync.calendar_sync import event_to_row, row_to_event_body
+from typing import Any
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from lattice.models import CalendarCache
+from lattice.sync.calendar_sync import event_to_row, row_to_event_body, sync_window
 
 # --------------------------------------------------------------------------- #
 # event_to_row
@@ -142,3 +149,90 @@ def test_row_to_event_body_all_day() -> None:
         "start": {"date": "2026-05-20"},
         "end": {"date": "2026-05-21"},
     }
+
+
+# --------------------------------------------------------------------------- #
+# sync_window — reconciliation of Google-side deletions
+# --------------------------------------------------------------------------- #
+
+
+class _FakeClient:
+    """Minimal stand-in returning a scripted event list per call."""
+
+    def __init__(self, batches: list[list[dict[str, Any]]]) -> None:
+        self._batches = batches
+        self._i = 0
+
+    async def list_events(
+        self, *, time_min: str, time_max: str, calendar_id: str = "primary",
+    ) -> list[dict[str, Any]]:
+        batch = self._batches[min(self._i, len(self._batches) - 1)]
+        self._i += 1
+        return batch
+
+
+def _ev(event_id: str, summary: str) -> dict[str, Any]:
+    return {
+        "id": event_id,
+        "status": "confirmed",
+        "summary": summary,
+        "start": {"dateTime": "2026-06-05T08:20:00+02:00"},
+        "end": {"dateTime": "2026-06-05T13:50:00+02:00"},
+    }
+
+
+WINDOW = ("2026-06-04T00:00:00+02:00", "2026-06-06T00:00:00+02:00")
+
+
+async def _ids(session: AsyncSession) -> set[str]:
+    rows = (await session.execute(select(CalendarCache.google_event_id))).scalars().all()
+    return set(rows)
+
+
+@pytest.mark.asyncio
+async def test_sync_window_prunes_event_deleted_in_google(
+    db_session: AsyncSession,
+) -> None:
+    """An event present in one fetch then gone in the next is removed from cache."""
+    client = _FakeClient([
+        [_ev("school", "Szkoła"), _ev("clatra", "Clatra")],
+        [_ev("clatra", "Clatra")],  # school deleted directly in Google
+    ])
+    await sync_window(db_session, *WINDOW, client=client)
+    assert await _ids(db_session) == {"school", "clatra"}
+
+    await sync_window(db_session, *WINDOW, client=client)
+    assert await _ids(db_session) == {"clatra"}
+
+
+@pytest.mark.asyncio
+async def test_sync_window_empty_fetch_clears_window(
+    db_session: AsyncSession,
+) -> None:
+    """When Google returns nothing for the window, all overlapping rows drop."""
+    client = _FakeClient([[_ev("school", "Szkoła")], []])
+    await sync_window(db_session, *WINDOW, client=client)
+    assert await _ids(db_session) == {"school"}
+
+    await sync_window(db_session, *WINDOW, client=client)
+    assert await _ids(db_session) == set()
+
+
+@pytest.mark.asyncio
+async def test_sync_window_keeps_events_outside_window(
+    db_session: AsyncSession,
+) -> None:
+    """Reconciliation must not touch rows outside the synced window."""
+    outside = {
+        "id": "future",
+        "status": "confirmed",
+        "summary": "Far away",
+        "start": {"dateTime": "2026-06-20T08:00:00+02:00"},
+        "end": {"dateTime": "2026-06-20T09:00:00+02:00"},
+    }
+    far_window = ("2026-06-19T00:00:00+02:00", "2026-06-21T00:00:00+02:00")
+    await sync_window(db_session, *far_window, client=_FakeClient([[outside]]))
+
+    # Syncing a different, empty window leaves the far-away event intact.
+    await sync_window(db_session, *WINDOW, client=_FakeClient([[]]))
+    assert await _ids(db_session) == {"future"}

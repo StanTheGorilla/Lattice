@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lattice.config import settings
+from lattice.functions.data_freshness import get_data_freshness
 from lattice.functions.habits_adherence import compute_habit_adherence
 from lattice.functions.readiness import compute_readiness
 from lattice.functions.sleep_pattern import sleep_pattern
@@ -68,6 +69,13 @@ async def get_quick_context(session: AsyncSession) -> dict[str, Any]:
         to_iso=today.isoformat(),
     )
 
+    # Garmin sync freshness — surfaces "watch hasn't synced" before the
+    # LLM treats older sleep/HRV/RHR rows as if they were last night's.
+    try:
+        freshness = await get_data_freshness(session)
+    except Exception:  # noqa: BLE001 — fail-soft
+        freshness = {"status": "unknown", "is_stale": False, "advisory": ""}
+
     # Last workout, regardless of kind.
     lw = await last_workout(session)
 
@@ -86,6 +94,7 @@ async def get_quick_context(session: AsyncSession) -> dict[str, Any]:
     return {
         "window": {"from": seven_days_back.isoformat(), "to": today.isoformat()},
         "today": today.isoformat(),
+        "data_freshness": freshness,
         "readiness_today": readiness_block,
         "seven_day_medians": medians,
         "sleep_pattern": {
