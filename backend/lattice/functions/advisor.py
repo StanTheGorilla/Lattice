@@ -14,7 +14,6 @@ from datetime import date
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lattice.functions.readiness import compute_readiness
-from lattice.functions.sleep_window import compute_sleep_window
 from lattice.functions.training_rec import compute_training_rec
 from lattice.functions.work_windows import compute_work_windows
 from lattice.schemas.functions import (
@@ -138,17 +137,23 @@ async def _train(
 async def _rest(
     session: AsyncSession, *, target: date, tz: str,
 ) -> AdvisorOutput:
-    """Returns F4 sleep window verbatim, with flags as reasons."""
-    sleep = await compute_sleep_window(session, target=target, tz=tz)
+    """Returns the stored sleep recommendation (AI decision if present, else F4
+    seed) verbatim, with flags + rationale as reasons."""
+    from lattice.functions.recommendation_store import get_active_sleep_recommendation
+
+    sleep = await get_active_sleep_recommendation(session, target=target, tz=tz)
+    reasons = [
+        f"bedtime {sleep.bedtime} → wake {sleep.wake_time}",
+        f"target duration {sleep.target_duration_min:.0f} min",
+        *sleep.flags,
+    ]
+    if sleep.source == "ai" and sleep.rationale:
+        reasons.append(f"AI: {sleep.rationale}")
     return AdvisorOutput(
         intent="rest",
         recommendation="sleep_window",
         confidence=0.9,
-        reasons=[
-            f"bedtime {sleep.bedtime} → wake {sleep.wake_time}",
-            f"target duration {sleep.target_duration_min:.0f} min",
-            *sleep.flags,
-        ],
+        reasons=reasons,
     )
 
 

@@ -75,7 +75,7 @@ class SleepWindowOutput(BaseModel):
     wake_time: str
     target_duration_min: float
     flags: list[str]
-    inputs: dict[str, str | float | int | None]
+    inputs: dict[str, str | bool | int | float | None]
 
 
 # --------------------------------------------------------------------------- #

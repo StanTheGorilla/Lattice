@@ -16,25 +16,35 @@ from lattice.functions.advisor import compute_advisor
 from lattice.functions.caffeine import compute_caffeine_status
 from lattice.functions.habits_adherence import compute_habit_adherence
 from lattice.functions.readiness import compute_readiness
+from lattice.functions.recommendation_store import (
+    clear_sleep_recommendation,
+    get_active_sleep_recommendation,
+)
 from lattice.functions.sleep_window import compute_sleep_window
 from lattice.functions.training_rec import compute_training_rec
 from lattice.functions.work_windows import compute_work_windows
+from lattice.llm.router import run_agent
 from lattice.schemas.functions import (
     AdvisorIntent,
     AdvisorOutput,
     CaffeineStatusOutput,
     HabitAdherenceOutput,
     ReadinessOutput,
-    SleepWindowOutput,
     TrainingRecOutput,
     WorkWindowsOutput,
 )
+from lattice.schemas.recommendation import SleepRecommendation
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/functions", tags=["functions"], dependencies=[Depends(require_auth)],
 )
+
+
+def _hhmm(iso: str) -> str:
+    """Extract HH:MM from an ISO 8601 datetime for compact prompt text."""
+    return iso[11:16] if "T" in iso and len(iso) >= 16 else iso
 
 
 def _parse_date_or_today(value: str | None, tz: str) -> date:
@@ -93,13 +103,121 @@ async def get_training_recommendation(
     )
 
 
-@router.get("/sleep_window", response_model=SleepWindowOutput)
+@router.get("/sleep_window", response_model=SleepRecommendation)
 async def get_sleep_window(
     date_: str | None = Query(default=None, alias="date"),
     session: AsyncSession = Depends(get_session),
-) -> SleepWindowOutput:
+) -> SleepRecommendation:
+    """The stored sleep recommendation: the AI's decision if it has made one for
+    this date, else an F4 formula seed. The website Today page and the evening
+    brief both read this endpoint, so they converge on the same numbers."""
     target = _parse_date_or_today(date_, settings.timezone)
-    return await compute_sleep_window(session, target=target, tz=settings.timezone)
+    return await get_active_sleep_recommendation(
+        session, target=target, tz=settings.timezone,
+    )
+
+
+@router.post("/sleep_window/regenerate", response_model=SleepRecommendation)
+async def regenerate_sleep_window(
+    date_: str | None = Query(default=None, alias="date"),
+    session: AsyncSession = Depends(get_session),
+) -> SleepRecommendation:
+    """Ask the AI to decide and persist tonight's sleep window, then return it.
+
+    This is the Today page's "Regenerate with AI" action. It runs the chat agent
+    in-process with a fixed instruction to weigh recovery, calendar, and healthy
+    sleep guidelines (rather than blindly echoing the F4 median, which can imply
+    an unhealthily short night or a very late bedtime) and to persist its decision
+    via set_sleep_recommendation. The Today card and evening brief then read the
+    same AI row.
+    """
+    target = _parse_date_or_today(date_, settings.timezone)
+    # Compute the deterministic F4 window FRESH (not the stored row, which may
+    # already be a prior AI decision) so the AI can see exactly what the
+    # algorithm chose and why before forming its own answer.
+    f4 = await compute_sleep_window(session, target=target, tz=settings.timezone)
+    instruction = (
+        "Here is what the deterministic F4 sleep algorithm just computed, and "
+        "the reasoning behind each number:\n"
+        f"- Bedtime {_hhmm(f4.bedtime)}, wake {_hhmm(f4.wake_time)}, "
+        f"target {f4.target_duration_min:.0f} min.\n"
+        f"- Wake derived from: {f4.inputs.get('wake_derivation')}.\n"
+        f"- Baseline duration {f4.inputs.get('baseline_duration_min')} min — the "
+        "median of my sleep on nights followed by good readiness, from "
+        f"{f4.inputs.get('qualifying_days_for_baseline')} qualifying days.\n"
+        f"- Recovery adjustment {f4.inputs.get('recovery_adjustment_min')} min "
+        f"({f4.inputs.get('recovery_basis') or 'today near baseline'}).\n"
+        f"- Flags: {'; '.join(f4.flags) or 'none'}.\n\n"
+        "Use the algorithm's numbers and reasoning as your starting point. Agree "
+        "with it where it is sound, but OVERRIDE it where it is unhealthy — e.g. "
+        "if it echoes an unhealthily short median or an unreasonably late bedtime "
+        "for my age and situation. Weigh my recovery signals (HRV, stress, body "
+        "battery) and tomorrow's first calendar commitment too. Then persist your "
+        "decision by calling set_sleep_recommendation with bedtime, wake_time, and "
+        "a concise one-sentence rationale that says how your choice relates to the "
+        "algorithm's. Reply with just the bedtime, wake time, and why."
+    )
+    try:
+        await run_agent(session, history=[], user_message=instruction)
+    except Exception as exc:  # noqa: BLE001 — surface a clean 502 to the client
+        logger.warning("sleep_window regenerate failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "ai_unavailable",
+                "message": "The AI could not generate a sleep window right now.",
+            },
+        ) from exc
+    return await get_active_sleep_recommendation(
+        session, target=target, tz=settings.timezone,
+    )
+
+
+@router.post("/sleep_window/revert", response_model=SleepRecommendation)
+async def revert_sleep_window(
+    date_: str | None = Query(default=None, alias="date"),
+    session: AsyncSession = Depends(get_session),
+) -> SleepRecommendation:
+    """Discard any AI sleep decision for the date and fall back to the F4
+    algorithm. Returns the fresh deterministic (`formula`) recommendation."""
+    target = _parse_date_or_today(date_, settings.timezone)
+    await clear_sleep_recommendation(session, target=target)
+    return await get_active_sleep_recommendation(
+        session, target=target, tz=settings.timezone,
+    )
+
+
+@router.get("/sleep_window/formula", response_model=SleepRecommendation)
+async def get_sleep_window_formula(
+    date_: str | None = Query(default=None, alias="date"),
+    session: AsyncSession = Depends(get_session),
+) -> SleepRecommendation:
+    """The live deterministic F4 window, computed fresh and NOT persisted.
+
+    Powers the Today card's Algorithm tab so it can be reloaded independently of
+    the stored (possibly AI-owned) recommendation. This never overwrites the AI
+    decision — it is a read-only preview of what the algorithm currently says.
+    """
+    target = _parse_date_or_today(date_, settings.timezone)
+    f4 = await compute_sleep_window(session, target=target, tz=settings.timezone)
+    wake_deriv = f4.inputs.get("wake_derivation")
+    rationale_parts: list[str] = []
+    if isinstance(wake_deriv, str):
+        rationale_parts.append(f"Wake: {wake_deriv}.")
+    if f4.flags:
+        rationale_parts.append("Flags: " + "; ".join(f4.flags) + ".")
+    rationale = " ".join(rationale_parts) or "Derived from the F4 sleep-window formula."
+    return SleepRecommendation(
+        date=f4.date,
+        bedtime=f4.bedtime,
+        wake_time=f4.wake_time,
+        target_duration_min=f4.target_duration_min,
+        flags=f4.flags,
+        inputs=f4.inputs,
+        source="formula",
+        rationale=rationale,
+        author="f4_live",
+    )
 
 
 @router.get("/caffeine_status", response_model=CaffeineStatusOutput)

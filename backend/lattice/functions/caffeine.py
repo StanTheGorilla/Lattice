@@ -18,7 +18,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lattice.functions.baselines import parse_iso
-from lattice.functions.sleep_window import compute_sleep_window
 from lattice.models import Entry
 from lattice.schemas.functions import CaffeineStatusOutput
 
@@ -90,7 +89,13 @@ async def compute_caffeine_status(
     if bedtime_override is not None:
         bedtime = bedtime_override.astimezone(zone)
     else:
-        sleep = await compute_sleep_window(session, target=target, tz=tz)
+        # Read the stored recommendation (AI decision if present, else F4 seed)
+        # so caffeine headroom is computed against the same bedtime the user
+        # sees everywhere — not a second, divergent F4 call.
+        from lattice.functions.recommendation_store import (
+            get_active_sleep_recommendation,
+        )
+        sleep = await get_active_sleep_recommendation(session, target=target, tz=tz)
         bedtime = parse_iso(sleep.bedtime).astimezone(zone)
 
     cups = await _today_caffeine(session, target, tz)
