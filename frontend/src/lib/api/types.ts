@@ -638,3 +638,42 @@ export interface RoutineListResponse {
 	items: Routine[];
 	total: number;
 }
+
+// ---------- routine run history (P3-2) ----------
+
+export interface RoutineRun {
+	id: number;
+	routine_id: number;
+	fired_at: string;
+	sent: boolean;
+	suppressed: boolean;
+	reply_excerpt: string | null;
+	detail: string | null;
+}
+
+export interface RoutineRunListResponse {
+	items: RoutineRun[];
+}
+
+// ---------- LLM observability (P3-1) ----------
+
+export interface LlmUsageDay {
+	date: string;
+	input_tokens: number;
+	output_tokens: number;
+	total_tokens: number;
+	est_cost_usd: number;
+}
+
+export interface LlmUsageSummary {
+	days: LlmUsageDay[];
+	totals: {
+		input_tokens: number;
+		output_tokens: number;
+		total_tokens: number;
+		est_cost_usd: number;
+	};
+	window_days: number;
+	input_usd_per_mtok: number;
+	output_usd_per_mtok: number;
+}

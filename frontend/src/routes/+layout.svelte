@@ -27,6 +27,7 @@
 		{ href: '/memory', label: 'Memory', key: 'M', section: 'more' },
 		{ href: '/algorithms', label: 'Algorithms', key: 'A', section: 'more' },
 		{ href: '/alerts', label: 'Alerts', key: 'N', section: 'more' },
+		{ href: '/usage', label: 'Usage', key: 'U', section: 'more' },
 		{ href: '/settings', label: 'Settings', key: 'S', section: 'more' }
 	];
 

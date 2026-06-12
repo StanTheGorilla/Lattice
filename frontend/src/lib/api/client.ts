@@ -415,16 +415,29 @@ export const memoryApi = {
 
 // ---------- routines (Phase B) ----------
 
-import type { Routine, RoutineInput, RoutineListResponse } from './types';
+import type {
+	LlmUsageSummary,
+	Routine,
+	RoutineInput,
+	RoutineListResponse,
+	RoutineRunListResponse
+} from './types';
 
 export const routinesApi = {
 	list: () => request<RoutineListResponse>('/routines'),
+	runs: (limit = 20) => request<RoutineRunListResponse>(`/routines/runs${qs({ limit })}`),
 	create: (body: RoutineInput) =>
 		request<Routine>('/routines', { method: 'POST', body: JSON.stringify(body) }),
 	patch: (id: number, body: Partial<RoutineInput>) =>
 		request<Routine>(`/routines/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
 	remove: (id: number) => request<void>(`/routines/${id}`, { method: 'DELETE' }),
 	run: (id: number) => request<Routine>(`/routines/${id}/run`, { method: 'POST' })
+};
+
+// ---------- LLM observability (P3-1) ----------
+
+export const observabilityApi = {
+	llmUsage: (days = 30) => request<LlmUsageSummary>(`/observability/llm-usage${qs({ days })}`)
 };
 
 // ---------- reports (F7 weekly) ----------

@@ -26,6 +26,7 @@ from lattice.api import (
     memory,
     metrics,
     nutrition,
+    observability,
     planning,
     reports,
     research,
@@ -145,6 +146,7 @@ app.include_router(memory.router, prefix="/api")
 app.include_router(algorithms.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(routines.router, prefix="/api")
+app.include_router(observability.router, prefix="/api")
 
 
 @app.get("/{full_path:path}", include_in_schema=False)
