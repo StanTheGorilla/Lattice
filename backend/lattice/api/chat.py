@@ -43,6 +43,88 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+# Keys we surface in the digest in priority order. Strings only; values are
+# coerced to short string forms with `_format_value`.
+_DIGEST_PREFERRED_KEYS: tuple[str, ...] = (
+    "score", "readiness", "category",
+    "duration_min", "sleep_score", "sleep_duration_min",
+    "bedtime", "wake_time", "target_duration_min",
+    "residual_at_bedtime_mg", "safe_for_new_cup", "last_call_minutes",
+    "recommendation", "confidence",
+    "status", "advisory",
+    "date", "value",
+)
+
+_DIGEST_MAX_PAIRS = 4
+_DIGEST_MAX_TOOLS = 6
+_DIGEST_MAX_CHARS = 400
+
+
+def _format_value(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float):
+            return f"{value:.1f}".rstrip("0").rstrip(".") or "0"
+        return str(value)
+    if isinstance(value, str):
+        v = value.strip()
+        return v[:60] if v else None
+    return None
+
+
+def _summarize_result(result: dict[str, object]) -> str:
+    """Pick a few salient key=value pairs from a tool result for the digest."""
+    seen: list[str] = []
+    for key in _DIGEST_PREFERRED_KEYS:
+        if key in result:
+            formatted = _format_value(result[key])
+            if formatted is not None:
+                seen.append(f"{key}={formatted}")
+                if len(seen) >= _DIGEST_MAX_PAIRS:
+                    break
+    if not seen:
+        # Fall back to the first few simple scalars.
+        for key, value in result.items():
+            if key.startswith("_") or key in {"items", "rows"}:
+                continue
+            formatted = _format_value(value)
+            if formatted is None:
+                continue
+            seen.append(f"{key}={formatted}")
+            if len(seen) >= _DIGEST_MAX_PAIRS:
+                break
+    return ", ".join(seen)
+
+
+def build_data_digest(tool_summaries: list[ToolCallSummary]) -> str | None:
+    """Return a short plain-text digest of what tools surfaced this turn.
+
+    Format: ``data consulted: <tool>(<k=v, …>); <tool>(<k=v, …>); …`` —
+    truncated to `_DIGEST_MAX_CHARS`. Returns None when nothing useful was
+    consulted (no successful tool calls), so the assistant row stays clean.
+    """
+    if not tool_summaries:
+        return None
+    pieces: list[str] = []
+    for summary in tool_summaries[:_DIGEST_MAX_TOOLS]:
+        if not summary.ok or not isinstance(summary.result, dict):
+            continue
+        body = _summarize_result(summary.result)
+        if body:
+            pieces.append(f"{summary.name}({body})")
+        else:
+            pieces.append(f"{summary.name}(ok)")
+    if not pieces:
+        return None
+    text = "data consulted: " + "; ".join(pieces)
+    if len(text) > _DIGEST_MAX_CHARS:
+        text = text[: _DIGEST_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
+
 def _is_within_idle_window(latest_ts: str | None) -> bool:
     """True if `latest_ts` is younger than the session idle threshold."""
     if not latest_ts:
@@ -97,7 +179,14 @@ async def _load_history(
     for row in rows:
         if row.role not in ("user", "assistant"):
             continue
-        history.append({"role": row.role, "content": row.content})
+        content = row.content
+        # P2-3: replay the compact tool-result digest as plain text *prefixed*
+        # to the assistant reply, so the model sees what data its prior reply
+        # was reacting to. Plain text keeps the OpenAI message contract intact
+        # (no orphan tool_call blocks that would need their matching results).
+        if row.role == "assistant" and getattr(row, "data_digest", None):
+            content = f"[{row.data_digest}]\n{row.content}"
+        history.append({"role": row.role, "content": content})
     return history
 
 
@@ -134,6 +223,7 @@ async def _persist_turn(
                 for t in tool_summaries
             ],
         )
+    digest = build_data_digest(tool_summaries)
     session.add(
         Conversation(
             timestamp=_now_iso(),
@@ -141,6 +231,7 @@ async def _persist_turn(
             content=assistant_reply,
             tool_calls=tool_calls_json,
             session_id=session_id,
+            data_digest=digest,
         ),
     )
     await session.commit()

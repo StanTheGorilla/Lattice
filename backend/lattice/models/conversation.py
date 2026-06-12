@@ -17,3 +17,8 @@ class Conversation(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     tool_calls: Mapped[str | None] = mapped_column(Text, nullable=True)
     session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # P2-3: compact plain-text summary of the data consulted this turn
+    # ("data consulted: readiness=77, sleep 6h42m, …"). Replayed as plain
+    # text in `_load_history` so follow-up turns retain context without
+    # violating the OpenAI tool_call/tool_result message contract.
+    data_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
