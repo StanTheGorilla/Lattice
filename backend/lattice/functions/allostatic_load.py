@@ -5,7 +5,10 @@ biomarker systems. Each marker is scored 0 (healthy) or 1 (stressed) based
 on whether the recent value falls in an adverse quartile relative to the
 user's own trailing distribution — personalised, not population-based.
 
-Markers used:
+Markers used (P1-6: `readiness_score` dropped — it is itself derived from
+HRV/RHR/sleep/body-battery/stress, so including it double-counts each
+underlying system. The published McEwen/Seeman framework uses independent
+physiological systems):
   HRV           hrv_overnight_avg      — low = stressed (bottom quartile)
   Resting HR    resting_hr             — high = stressed (top quartile)
   Sleep quality sleep_score            — low = stressed (bottom quartile)
@@ -13,9 +16,13 @@ Markers used:
   Stress        stress_avg             — high = stressed (top quartile)
   Body battery  body_battery_start     — low = stressed (bottom quartile)
   VO2max        vo2_max                — low = stressed (bottom quartile)
-  Readiness     readiness_score        — low = stressed (bottom quartile)
 
-Score 0-8: 0-1 = low load, 2-3 = moderate, 4-5 = high, 6+ = very high.
+Score 0-7: 0-1 = low load, 2-3 = moderate, 4-5 = high, 6+ = very high.
+
+A baseline-relative quartile flag is informative but, by construction, ~25 %
+of any normal week's days fall in the user's own adverse quartile — so even
+a healthy week can score 1-2/7. The interpretation text reflects this:
+moderate is described as "within normal variation", not as warning.
 
 References: McEwen (1998, 2003), Seeman et al. (2004) framework adapted
 for wearable biomarker data.
@@ -34,7 +41,6 @@ from lattice.config import settings
 from lattice.models import Metric
 
 _BASELINE_DAYS = 90
-_QUARTILE_WINDOW = 30  # days for 'recent' value averaging
 
 _MARKERS: list[dict[str, Any]] = [
     {"name": "hrv_overnight_avg",  "direction": "low_bad",  "label": "HRV"},
@@ -45,7 +51,6 @@ _MARKERS: list[dict[str, Any]] = [
     {"name": "stress_avg",         "direction": "high_bad", "label": "Stress"},
     {"name": "body_battery_start", "direction": "low_bad",  "label": "Body battery"},
     {"name": "vo2_max",            "direction": "low_bad",  "label": "VO2max"},
-    {"name": "readiness_score",    "direction": "low_bad",  "label": "Readiness"},
 ]
 
 
@@ -149,13 +154,19 @@ async def compute_allostatic_load(
             "direction": direction,
         })
 
-    # Category
-    if score <= 1:
+    # Category — interpretation accounts for baseline-relative scoring.
+    # ~25 % of normal days fall in the user's own adverse quartile, so a
+    # healthy week typically scores 1–2/7 even with no real strain.
+    if score <= 2:
         category = "low"
-        cat_text = "low allostatic load — systems well-regulated"
-    elif score <= 3:
+        cat_text = (
+            "allostatic load within normal variation — systems well-regulated"
+        )
+    elif score <= 4:
         category = "moderate"
-        cat_text = "moderate allostatic load — some systems showing strain"
+        cat_text = (
+            "elevated allostatic load — a few systems trending below baseline"
+        )
     elif score <= 5:
         category = "high"
         cat_text = "high allostatic load — multiple systems under stress"
