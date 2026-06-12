@@ -1,9 +1,22 @@
 # Lattice — Project Specification (v1)
 
-**Status:** Source of truth. Both `CLAUDE_DESIGN_PROMPT.md` and `CLAUDE_CODE_PROMPT.md` reference this document.
+**Status:** Original v1 spec. Partly superseded — see the **amendment** below and
+`PLAN.md` → *Rework R (Coherence)* for the current architecture.
 **Owner:** Stan (single user)
-**Target platform:** Windows (native, not WSL)
+**Target platform:** ~~Windows~~ → now runs on a Raspberry Pi via `start.sh`.
 **Visibility:** Private repo (GitHub possible, not public)
+
+> ### Amendment (2026-06-03): AI-as-brain
+> Section 1 below says the LLM is *"an interface and synthesis layer, never the reasoning
+> core."* After two weeks of real use this was **reversed**. The AI is now the single brain:
+> it owns one stored recommendation (the `recommendations` keyed store) that the website,
+> Discord briefs, and chat all read, so the surfaces can no longer disagree. The deterministic
+> functions (readiness, sleep window F4, advisor F9a, etc.) remain — but as **inputs the AI
+> weighs**, not as competing displayed answers. The three fixed Discord briefings are replaced
+> by user-configurable **routines** (scheduled AI check-ins + reminders, each with per-routine
+> proactive chattiness). Subsystems added since this spec was frozen and not described below:
+> recommendations store, routines, alerts UI/tools, custom algorithms, dashboard cards, user
+> memory, research agent, nutrition. See `PLAN.md` for all of them.
 
 ---
 

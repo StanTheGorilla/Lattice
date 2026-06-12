@@ -2,6 +2,76 @@
 
 Strict phase order. Each phase verified before next begins.
 
+> **Current state (2026-06-03):** the app runs on a Raspberry Pi via `start.sh`
+> (not the original Windows `start.bat`). After two weeks of real use the build was
+> reworked for coherence — see **Rework R (Coherence)** below, which supersedes the
+> "deterministic functions are canonical, LLM is only an interface" stance of the
+> original SPEC. The headline architectural decision is now **AI-as-brain**: the
+> assistant owns one stored recommendation that every surface reads.
+
+## Rework R — Coherence, single source of truth, routines
+Status: A & B done; C & D done (2026-06-03)
+
+**Motivation.** Subsystems worked in isolation but disagreed across surfaces (web,
+Discord, chat). Root cause: the chat AI reasoned *past* the deterministic formulas while
+the website and briefs printed *raw* formula output — so the same question got different
+answers depending on where you asked. Owner's verdict: the AI should be the single brain,
+because it alone sees the calendar plus everything the user tells it.
+
+### R-A — Single source of truth (sleep recommendation)
+- [x] `recommendations` keyed store (`models/recommendation.py`, migration `0014`) keyed by
+  `(kind, target_date)`, matching the existing keyed-store pattern.
+- [x] `functions/recommendation_store.py` — `get_active_sleep_recommendation` returns the
+  `source='ai'` row if it exists for today, else lazily UPSERTs an F4 `source='formula'`
+  seed. **Invariant (unit-tested): a formula seed never overwrites an AI row.**
+- [x] WRITE tool `set_sleep_recommendation` → the chat AI persists its bedtime/wake; the
+  `/functions/sleep_window` endpoint now returns the *stored* value, so the Today card and
+  evening brief converge with zero client changes. F5 caffeine math reads the same getter.
+- [x] Today sleep card shows an `AI`/`formula` provenance badge + rationale.
+
+### R-B — Routines + proactive engine (replaces the 3 fixed briefs)
+- [x] `routines` table (`models/routine.py`, migration `0015`, seeds the 3 old briefs as
+  editable `ai_review` routines). Type is `ai_review` (the AI is run with an instruction and
+  its reply is DM'd) or `reminder` (fixed text DM'd). `weekday_mask` is a 7-bit int.
+- [x] Per-routine `chattiness`: `always` vs `only_notable` (silent unless a notability bar is
+  crossed; enforced by a shared `NOTABLE_SENTINEL` checked by both prompt builder and runner).
+- [x] Scheduling lives backend-side (`sync/scheduler.py`, one `CronTrigger` per routine, live
+  `reschedule`). Backend DMs directly via `integrations/discord_dm`; the bot is now a pure DM
+  listener. `bot/lattice_bot/briefings.py` deleted.
+- [x] `/routines` web page + `routinesApi` client + LLM tools
+  (`create_routine`/`update_routine`/`delete_routine`/`list_routines`).
+
+### R-C — Finish & connect kept subsystems
+- [x] **Alerts** — `/alerts` web page (create/pause/delete threshold rules + recent-fires log)
+  and LLM tools (`create_alert`/`list_alerts`/`delete_alert`). The hourly `_alert_check_job`
+  and rule model already existed; only the create surface was missing.
+- [x] **Planning** — the Protocol page gained create forms for Areas and Initiatives and a
+  visible, editable **AI Rules** section (previously the AI rules shaped the prompt but were
+  invisible in the UI). Backend CRUD already existed.
+
+### R-D — Web UI coherence
+- [x] Today sleep card renders the stored recommendation with provenance (see R-A).
+- [x] Nav grouped into a primary daily set (Today / Trends / Log / Habits / Routines / Chat)
+  and a **More** section (Report / Protocol / Research / Memory / Algorithms / Alerts /
+  Settings) — keeps the 13 items legible without removing pages.
+- [x] Docs refreshed (this section).
+
+### Rework decisions log
+- **R-1**: AI owns one decision. A single stored recommendation that website, Discord, and
+  chat all read. Deterministic functions (F4, F9a) become *inputs* the AI weighs, not
+  competing displayed answers. This reverses the original SPEC's "LLM is never the reasoning
+  core."
+- **R-2**: Routines run entirely backend-side. The backend owns the DB, the agent loop, and
+  can DM directly — so the bot stays a thin listener and nothing is lost if the bot restarts.
+- **R-3**: `only_notable` uses ONE LLM call, not two. The composed prompt instructs the model
+  to reply with exactly `NOTHING_NOTABLE` when nothing crosses the bar; the runner suppresses
+  the DM on that sentinel. A shared module constant prevents prompt/check drift.
+- **R-4**: Planning stays AI-read-only for now (the AI reads initiatives/decisions/rules into
+  its system prompt but does not create/close them autonomously); the new web forms give the
+  owner direct control. Revisit if the owner wants the AI to propose plan changes.
+- **R-5**: Alerts (single metric crossing a fixed number) are kept distinct from `ai_review`
+  routines (open-ended judgement). The prompt steers the AI to pick the right one.
+
 ## Phase 2A — Scaffolding
 Status: done — awaiting verification
 - [x] Directory structure per SPEC.md Section 3
