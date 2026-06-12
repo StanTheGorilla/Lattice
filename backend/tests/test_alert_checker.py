@@ -14,6 +14,22 @@ from lattice.models.alert import AlertEvent, AlertRule
 from .conftest import add_metric
 
 
+@pytest.fixture(autouse=True)
+def _silence_staleness_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests target user-defined rule logic only.
+
+    `run_alert_check` also runs the P3-3 Garmin-staleness watchdog, which fires
+    on the deliberately-old fixture metrics here. Stub freshness to a fresh
+    status so the watchdog stays silent; it has dedicated coverage in
+    `test_staleness_watchdog.py`.
+    """
+
+    async def fresh(_session: Any) -> dict[str, Any]:
+        return {"status": "fresh", "hours_since_latest_metric": 1.0, "advisory": ""}
+
+    monkeypatch.setattr(alert_checker, "get_data_freshness", fresh)
+
+
 async def _add_rule(session: Any, **kw: Any) -> AlertRule:
     rule = AlertRule(
         metric_name=kw.get("metric_name", "hrv_overnight_avg"),

@@ -15,10 +15,22 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lattice.config import settings
+from lattice.functions.data_freshness import get_data_freshness
 from lattice.integrations.discord_dm import send_dm
 from lattice.models.alert import AlertEvent, AlertRule
 
 logger = logging.getLogger(__name__)
+
+# P3-3: the Garmin-staleness watchdog reuses the AlertEvent log for its
+# cooldown, but it isn't backed by a user-editable AlertRule row. A reserved
+# negative sentinel rule_id keeps its events out of real rules' cooldown
+# windows while still recording when we last warned.
+_STALE_WATCHDOG_RULE_ID = -1
+# Only DM once per day for a persistent staleness condition.
+_STALE_COOLDOWN_HOURS = 24
+# Staleness severity that warrants a DM (matches data_freshness statuses where
+# a whole night / >36h of data is missing — auth breakage or unsynced watch).
+_STALE_ALERTING_STATUSES = frozenset({"stale_today", "stale_severe"})
 
 _OPS = {
     "lt": lambda v, t: v < t,
@@ -47,7 +59,58 @@ async def run_alert_check(session: AsyncSession) -> int:
         except Exception:  # noqa: BLE001
             logger.exception("alert check failed for rule %d (%s)", rule.id, rule.label)
 
+    try:
+        fired += await _check_staleness_watchdog(session, now, now_iso)
+    except Exception:  # noqa: BLE001
+        logger.exception("staleness watchdog failed")
+
     return fired
+
+
+async def _check_staleness_watchdog(
+    session: AsyncSession,
+    now: datetime,
+    now_iso: str,
+) -> int:
+    """Default watchdog (P3-3): DM when Garmin data is meaningfully stale.
+
+    Fires when `data_freshness` reports `stale_today` or `stale_severe`
+    (≥1 missing night / >36h with no data — i.e. the watch hasn't synced or
+    Garmin auth is broken). Rate-limited to once per `_STALE_COOLDOWN_HOURS`
+    via a sentinel-rule AlertEvent so a persistent outage doesn't spam DMs.
+    """
+    freshness = await get_data_freshness(session)
+    status = freshness.get("status")
+    if status not in _STALE_ALERTING_STATUSES:
+        return 0
+
+    cutoff = (now - timedelta(hours=_STALE_COOLDOWN_HOURS)).isoformat()
+    recent = await session.execute(
+        select(AlertEvent).where(
+            AlertEvent.rule_id == _STALE_WATCHDOG_RULE_ID,
+            AlertEvent.fired_at >= cutoff,
+        ).limit(1),
+    )
+    if recent.first() is not None:
+        return 0
+
+    hours = freshness.get("hours_since_latest_metric")
+    msg = (
+        "⚠ **Lattice alert** — Garmin data is stale\n"
+        f"{freshness.get('advisory', 'No fresh Garmin data.')}"
+    )
+    await send_dm(msg)
+
+    session.add(
+        AlertEvent(
+            rule_id=_STALE_WATCHDOG_RULE_ID,
+            fired_at=now_iso,
+            value=float(hours) if isinstance(hours, (int, float)) else 0.0,
+        ),
+    )
+    await session.commit()
+    logger.info("staleness watchdog fired: status=%s", status)
+    return 1
 
 
 async def _check_rule(
