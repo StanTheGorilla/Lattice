@@ -29,13 +29,15 @@ def _utc_ms(dt: datetime) -> int:
 
 
 def test_extract_sleep_stages_from_levels_array() -> None:
+    # Garmin's numeric encoding (per `_LEVEL_TO_STAGE` in sync/garmin_sync.py):
+    # 0=deep, 1=light, 2=rem, 3=awake.
     base = datetime(2026, 5, 13, 22, 0, tzinfo=ZoneInfo("UTC"))
     payload = {
         "sleepLevels": [
             {"startGMT": _utc_ms(base),                                  "endGMT": _utc_ms(base + timedelta(minutes=15)), "activityLevel": 1.0},  # light
-            {"startGMT": _utc_ms(base + timedelta(minutes=15)),          "endGMT": _utc_ms(base + timedelta(minutes=90)), "activityLevel": 2.0},  # deep
-            {"startGMT": _utc_ms(base + timedelta(minutes=90)),          "endGMT": _utc_ms(base + timedelta(minutes=120)), "activityLevel": 3.0},  # rem
-            {"startGMT": _utc_ms(base + timedelta(minutes=120)),         "endGMT": _utc_ms(base + timedelta(minutes=125)), "activityLevel": 0.0},  # awake
+            {"startGMT": _utc_ms(base + timedelta(minutes=15)),          "endGMT": _utc_ms(base + timedelta(minutes=90)), "activityLevel": 0.0},  # deep
+            {"startGMT": _utc_ms(base + timedelta(minutes=90)),          "endGMT": _utc_ms(base + timedelta(minutes=120)), "activityLevel": 2.0},  # rem
+            {"startGMT": _utc_ms(base + timedelta(minutes=120)),         "endGMT": _utc_ms(base + timedelta(minutes=125)), "activityLevel": 3.0},  # awake
             {"startGMT": _utc_ms(base + timedelta(minutes=125)),         "endGMT": _utc_ms(base + timedelta(minutes=180)), "activityLevel": 1.0},  # light
         ],
     }

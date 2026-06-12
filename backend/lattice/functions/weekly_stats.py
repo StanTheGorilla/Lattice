@@ -553,6 +553,14 @@ async def compute_weekly_stats(
     zone = tz or settings.timezone
     monday, sunday, iso_week = iso_week_bounds(target)
     today = datetime.now(ZoneInfo(zone)).date()
+    # When stats are computed for a past ISO week, "this week's habit
+    # completion" must look at the target week, not the trailing 7 days of
+    # the real calendar. Clamp `today` into [monday, sunday] so the F8
+    # adherence window is the requested week, not today minus 6.
+    if today > sunday:
+        today = sunday
+    elif today < monday:
+        today = monday
 
     daily = await _daily_aggregates(session, monday, sunday, zone)
     averages = _averages(daily)

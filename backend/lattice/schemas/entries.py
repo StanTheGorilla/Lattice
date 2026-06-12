@@ -127,7 +127,13 @@ class FoodData(BaseModel):
 
 class DrinkData(BaseModel):
     type: Literal["drink"] = "drink"
-    kind: str  # canonical category: coffee / tea / alcohol / water / other
+    # `kind` is free-text — whatever the user typed (lowercased / trimmed).
+    # The `_DRINK_MAP` classifier is now only consulted to derive `sub_type`
+    # and `caffeine_mg`; the user's chosen label is preserved verbatim so the
+    # AI brain can reason over "latte" / "kombucha" / etc. rather than a
+    # bucketed canonical category. Downstream code that needs caffeinated-vs-not
+    # should consult `caffeine_mg > 0`, not match on `kind` strings (P1-3).
+    kind: str
     sub_type: str | None = None  # specific variant: latte / espresso / etc.
     caffeine_mg: float | None = None  # mg per unit (count=1); None = non-caffeinated
     volume_ml: float | None = None
@@ -135,10 +141,10 @@ class DrinkData(BaseModel):
 
     @model_validator(mode="after")
     def _auto_classify(self) -> "DrinkData":
-        """Normalize kind → canonical category + fill sub_type/caffeine_mg if absent."""
+        """Lowercase `kind`; fill `sub_type`/`caffeine_mg` from the classifier when absent."""
         if self.kind:
-            canon_kind, sub_type, caffeine = classify_drink(self.kind)
-            self.kind = canon_kind
+            self.kind = self.kind.strip().lower()
+            _, sub_type, caffeine = classify_drink(self.kind)
             if sub_type is not None and self.sub_type is None:
                 self.sub_type = sub_type
             if caffeine is not None and self.caffeine_mg is None:
