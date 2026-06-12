@@ -107,6 +107,7 @@ from lattice.sync.calendar_sync import (
     sync_window,
 )
 from lattice.sync.garmin_sync import sync_recent
+from lattice.utils import normalize_to_local_iso
 
 logger = logging.getLogger(__name__)
 
@@ -558,7 +559,14 @@ async def _h_log_entry(session: AsyncSession, args: dict[str, Any]) -> dict[str,
     except (ValidationError, ValueError) as exc:
         return _err("data failed schema validation", details=str(exc))
     now = _now_iso()
-    timestamp = args.get("timestamp") or now
+    # P1-1: event timestamps are stored in the local-TZ offset family so they
+    # sort correctly against the local cutoffs every functions/ query builds.
+    raw_ts = args.get("timestamp")
+    timestamp = (
+        normalize_to_local_iso(raw_ts)
+        if isinstance(raw_ts, str) and raw_ts
+        else datetime.now(ZoneInfo(settings.timezone)).isoformat(timespec="seconds")
+    )
     stored_data = validated.model_dump(exclude={"type"})
 
     # Auto-estimate nutrition for food entries (best-effort, never fails the log)

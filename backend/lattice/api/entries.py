@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import ValidationError
@@ -27,6 +28,7 @@ from lattice.schemas.entries import (
     EntryPatch,
     validate_data_for_type,
 )
+from lattice.utils import normalize_to_local_iso
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,14 @@ async def _estimate_and_patch(entry_id: int) -> None:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _event_now_iso() -> str:
+    """P1-1: event timestamps live in the local-TZ offset family (see
+    `normalize_to_local_iso`) so they sort correctly against the local cutoffs
+    every `functions/` query builds. `logged_at` stays UTC — it's a server
+    audit field, never compared against local cutoffs."""
+    return datetime.now(ZoneInfo(settings.timezone)).isoformat(timespec="seconds")
 
 
 def _validation_error(exc: ValidationError | ValueError) -> HTTPException:
@@ -121,7 +131,11 @@ async def create_entry(
         raise _validation_error(exc) from exc
 
     now = _now_iso()
-    timestamp = payload.timestamp or now
+    timestamp = (
+        normalize_to_local_iso(payload.timestamp)
+        if payload.timestamp
+        else _event_now_iso()
+    )
     row = Entry(
         timestamp=timestamp,
         logged_at=now,
@@ -154,7 +168,7 @@ async def patch_entry(
         )
 
     if payload.timestamp is not None:
-        row.timestamp = payload.timestamp
+        row.timestamp = normalize_to_local_iso(payload.timestamp)
 
     if payload.data is not None:
         try:

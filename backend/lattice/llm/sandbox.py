@@ -17,6 +17,7 @@ import threading
 logger = logging.getLogger(__name__)
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -199,17 +200,25 @@ async def fetch_algorithm_data(
     Only keys that are requested are included.
     """
     # Import here to avoid circular deps at module load time
+    from lattice.config import settings  # noqa: PLC0415
     from lattice.models import Entry, Metric  # noqa: PLC0415
     from lattice.sync.calendar_sync import cached_events_or_refresh  # noqa: PLC0415
 
-    now = datetime.now(UTC)
+    # P1-1: Metric/Entry rows are written with a local-TZ offset (Garmin sync +
+    # entry POSTs use the configured timezone), so cutoffs must be built in the
+    # SAME offset family for the lexicographic ISO comparison in the WHERE
+    # clause to be apples-to-apples. A UTC cutoff drifts by the local offset
+    # and can lose up to that many hours of recent data near the boundary.
+    tz_local = ZoneInfo(settings.timezone)
+    now_utc = datetime.now(UTC)
+    now_local = now_utc.astimezone(tz_local)
     result: dict[str, Any] = {}
 
     # ---- metrics ----
     for req in requirements.get("metrics", []):
         metric_name: str = req["name"]
         days: int = int(req.get("days", 14))
-        cutoff = (now - timedelta(days=days)).isoformat()
+        cutoff = (now_local - timedelta(days=days)).isoformat()
         stmt = (
             select(Metric)
             .where(Metric.metric_name == metric_name, Metric.timestamp >= cutoff)
@@ -224,7 +233,7 @@ async def fetch_algorithm_data(
     for req in requirements.get("entries", []):
         entry_type: str = req["type"]
         days = int(req.get("days", 7))
-        cutoff = (now - timedelta(days=days)).isoformat()
+        cutoff = (now_local - timedelta(days=days)).isoformat()
         stmt2 = (
             select(Entry)
             .where(Entry.type == entry_type, Entry.timestamp >= cutoff)
@@ -243,8 +252,8 @@ async def fetch_algorithm_data(
     # ---- calendar ----
     if "calendar" in requirements:
         cal_days: int = int(requirements["calendar"].get("days", 7))
-        time_min = now.isoformat()
-        time_max = (now + timedelta(days=cal_days)).isoformat()
+        time_min = now_local.isoformat()
+        time_max = (now_local + timedelta(days=cal_days)).isoformat()
         try:
             events = await cached_events_or_refresh(session, time_min, time_max)
             result["calendar"] = [
