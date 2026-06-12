@@ -24,6 +24,9 @@ from lattice.schemas.functions import CaffeineStatusOutput
 HALF_LIFE_HOURS = 5.0
 DEFAULT_DOSE_MG = 80.0
 MAX_BEDTIME_RESIDUAL_MG = 50.0
+# Conservative adolescent daily ceiling (AAP guidance: <100 mg/day for teens).
+# Surfaced as an informative flag in `get_caffeine_status`, not a hard block.
+DEFAULT_DAILY_CAP_MG = 100.0
 
 
 def _residual(dose_mg: float, hours_until: float) -> float:
@@ -33,12 +36,27 @@ def _residual(dose_mg: float, hours_until: float) -> float:
 
 
 async def _today_caffeine(
-    session: AsyncSession, target: date, tz: str,
+    session: AsyncSession,
+    target: date,
+    tz: str,
+    *,
+    until: datetime | None = None,
 ) -> list[tuple[datetime, float]]:
-    """Return (timestamp, dose_mg) tuples for today's caffeine entries."""
+    """Return (timestamp, dose_mg) tuples for today's caffeine entries.
+
+    P1-4: When `until` is given and lies after the end of `target`'s local
+    day (e.g. a 00:30 bedtime on the next calendar date), the query window
+    extends to `until` so after-midnight caffeine still counts against
+    tonight's bedtime residual. Without this, a 00:30 energy drink would
+    silently be excluded from the F5 residual calculation.
+    """
     zone = ZoneInfo(tz)
     day_start = datetime.combine(target, time.min, tzinfo=zone)
     day_end = day_start + timedelta(days=1)
+    if until is not None:
+        until_local = until.astimezone(zone)
+        if until_local > day_end:
+            day_end = until_local
     stmt = (
         select(Entry)
         .where(
@@ -98,19 +116,32 @@ async def compute_caffeine_status(
         sleep = await get_active_sleep_recommendation(session, target=target, tz=tz)
         bedtime = parse_iso(sleep.bedtime).astimezone(zone)
 
-    cups = await _today_caffeine(session, target, tz)
+    cups = await _today_caffeine(session, target, tz, until=bedtime)
+
+    # V-2: bedtime-residual ceiling + daily cap are AI-writable.
+    from lattice.functions.health_targets import (
+        CAFFEINE_BEDTIME_RESIDUAL_KIND,
+        CAFFEINE_DAILY_CAP_KIND,
+        get_target,
+    )
+    bedtime_residual_target = await get_target(session, CAFFEINE_BEDTIME_RESIDUAL_KIND)
+    daily_cap_target = await get_target(session, CAFFEINE_DAILY_CAP_KIND)
+    max_residual_mg = bedtime_residual_target.value
+    daily_cap_mg = daily_cap_target.value
 
     existing_residual = 0.0
+    total_today_mg = 0.0
     for ts, dose in cups:
         hours = (bedtime - ts).total_seconds() / 3600.0
         existing_residual += _residual(dose, hours)
+        total_today_mg += dose
 
     hours_now_to_bed = (bedtime - at).total_seconds() / 3600.0
     additional_if_now = _residual(DEFAULT_DOSE_MG, hours_now_to_bed)
-    safe_for_new_cup = (existing_residual + additional_if_now) <= MAX_BEDTIME_RESIDUAL_MG
+    safe_for_new_cup = (existing_residual + additional_if_now) <= max_residual_mg
 
     # last_call: solve for hours such that residual(80, hours) ≤ remaining headroom.
-    headroom = MAX_BEDTIME_RESIDUAL_MG - existing_residual
+    headroom = max_residual_mg - existing_residual
     if headroom <= 0:
         last_call_minutes = None  # No new cup is safe at all today.
     else:
@@ -124,14 +155,30 @@ async def compute_caffeine_status(
         delta_min = int((last_call_dt - at).total_seconds() / 60)
         last_call_minutes = max(0, delta_min) if delta_min >= 0 else None
 
+    # P1-5: daily total cap — informative only. The F5 residual contract is
+    # unchanged; this is an advisory flag the AI can weigh. V-2: cap value
+    # is read from the AI-writable health_targets store (see above).
+    flags: list[str] = []
+    if total_today_mg >= daily_cap_mg:
+        flags.append(
+            f"daily caffeine cap reached: {total_today_mg:.0f} mg of {daily_cap_mg:.0f} mg",
+        )
+    elif total_today_mg >= 0.8 * daily_cap_mg:
+        flags.append(
+            f"approaching daily caffeine cap: {total_today_mg:.0f} mg of {daily_cap_mg:.0f} mg",
+        )
+
     return CaffeineStatusOutput(
         at=at.isoformat(),
         bedtime=bedtime.isoformat(),
         residual_at_bedtime_mg=round(existing_residual, 2),
         safe_for_new_cup=safe_for_new_cup,
         last_call_minutes=last_call_minutes,
+        flags=flags,
         inputs={
             "cups_today": len(cups),
+            "total_today_mg": round(total_today_mg, 1),
+            "daily_cap_mg": daily_cap_mg,
             "headroom_mg": round(max(headroom, 0), 2),
             "hours_to_bed": round(hours_now_to_bed, 2),
             "default_dose_mg": DEFAULT_DOSE_MG,

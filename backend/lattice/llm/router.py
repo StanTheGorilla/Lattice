@@ -286,6 +286,94 @@ async def _h_set_sleep_recommendation(
     return _dump(rec)
 
 
+async def _h_get_health_targets(
+    session: AsyncSession, args: dict[str, Any],
+) -> dict[str, Any]:
+    """Return every active health target with provenance + outer bounds.
+
+    Lets the AI inspect what it (or the seed) currently has on file before
+    deciding whether to call `set_health_targets`.
+    """
+    from lattice.functions.health_targets import (
+        ALL_KINDS,
+        get_all_targets,
+        outer_bounds,
+    )
+    from lattice.functions.sleep_window import _age_on
+    from lattice.models import Profile as _Profile
+
+    profile = await session.get(_Profile, 1)
+    age = _age_on(profile.birthday, datetime.now(ZoneInfo(settings.timezone)).date()) if profile else None
+    targets = await get_all_targets(session)
+    out: list[dict[str, Any]] = []
+    for kind in ALL_KINDS:
+        t = targets[kind]
+        lo, hi = outer_bounds(kind, age)
+        out.append({
+            "kind": kind,
+            "value": t.value,
+            "source": t.source,
+            "rationale": t.rationale,
+            "author": t.author,
+            "bounds_for_age": {"min": lo, "max": hi},
+        })
+    return {"age": age, "targets": out}
+
+
+async def _h_set_health_targets(
+    session: AsyncSession, args: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist one or more AI-set health targets (V — versatility rework).
+
+    Values outside the per-age outer guardrails are clamped on write; the
+    clamp note is appended to the rationale so every surface displaying the
+    target shows "requested X, clamped to Y" automatically.
+    """
+    from lattice.functions.health_targets import (
+        ALL_KINDS,
+        HealthTargetWrite,
+        set_health_targets,
+    )
+
+    raw = args.get("targets")
+    if not isinstance(raw, list) or not raw:
+        return _err("`targets` must be a non-empty list of {kind, value} objects")
+    writes: list[HealthTargetWrite] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return _err("each target must be an object with `kind` and `value`")
+        kind = item.get("kind")
+        if kind not in ALL_KINDS:
+            return _err(
+                f"unknown kind '{kind}'; allowed: {', '.join(ALL_KINDS)}",
+            )
+        try:
+            value = float(item["value"])
+        except (KeyError, TypeError, ValueError):
+            return _err(f"`value` for {kind} must be a number")
+        writes.append(HealthTargetWrite(kind=kind, value=value))
+    rationale = args.get("rationale")
+    rationale_str = (
+        rationale.strip() if isinstance(rationale, str) and rationale.strip() else None
+    )
+    results = await set_health_targets(
+        session, writes=writes, rationale=rationale_str, author="chat",
+    )
+    return {
+        "written": [
+            {
+                "kind": r.kind,
+                "requested": r.requested,
+                "stored": r.stored,
+                "clamped": r.clamped,
+                "bounds": {"min": r.bounds[0], "max": r.bounds[1]},
+                "rationale": r.rationale,
+            }
+            for r in results
+        ],
+    }
+
+
 async def _h_get_caffeine_status(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
     tz = settings.timezone
     zone = ZoneInfo(tz)
@@ -1850,6 +1938,8 @@ HANDLERS = {
     "get_training_recommendation": _h_get_training_recommendation,
     "get_sleep_window": _h_get_sleep_window,
     "set_sleep_recommendation": _h_set_sleep_recommendation,
+    "get_health_targets": _h_get_health_targets,
+    "set_health_targets": _h_set_health_targets,
     "get_caffeine_status": _h_get_caffeine_status,
     "get_metric": _h_get_metric,
     "get_baseline": _h_get_baseline,
@@ -1943,7 +2033,7 @@ WRITE_TOOLS = {
     "patch_calendar_event", "delete_calendar_event",
     "sync_garmin", "sync_calendar",
     "save_plan", "save_research_paper",
-    "set_nutrition_goals", "set_sleep_recommendation",
+    "set_nutrition_goals", "set_sleep_recommendation", "set_health_targets",
     "remember", "update_memory", "forget",
     "create_routine", "update_routine", "delete_routine",
     "create_alert", "delete_alert",

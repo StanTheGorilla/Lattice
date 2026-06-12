@@ -89,6 +89,10 @@ class CaffeineStatusOutput(BaseModel):
     residual_at_bedtime_mg: float
     safe_for_new_cup: bool
     last_call_minutes: int | None  # minutes until cutoff; None if already over
+    # Informative flags (e.g. "daily cap reached: 120 mg of 100 mg"). The F5
+    # residual check stays the same; daily-cap is an *advisory* signal so the
+    # AI brain can surface it without blocking decisions (P1-5).
+    flags: list[str] = []
     inputs: dict[str, float | int | str | None]
 
 

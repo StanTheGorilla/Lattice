@@ -251,8 +251,16 @@ async def _today_caffeine_after_cutoff(
             data = json.loads(row.data)
         except json.JSONDecodeError:
             continue
+        # P1-3: F4 and F5 agree — an entry is caffeinated iff caffeine_mg > 0.
+        # Legacy "coffee"-kind entries pre-dating the caffeine_mg field still
+        # count (matches F5's legacy fallback). Substring-on-kind misses
+        # cola, yerba mate, kombucha, etc.
+        caffeine_mg = data.get("caffeine_mg")
         kind = str(data.get("kind") or "").lower()
-        if not any(w in kind for w in ("coffee", "tea", "latte", "espresso", "cappuccino", "americano", "matcha", "energy")):
+        if not (
+            (caffeine_mg is not None and float(caffeine_mg) > 0)
+            or kind == "coffee"
+        ):
             continue
         try:
             ts = parse_iso(row.timestamp).astimezone(zone)
@@ -420,9 +428,13 @@ async def compute_sleep_window(
         wake = first_event - timedelta(minutes=30)
         wake_note = f"30 min before first event {first_event.strftime('%H:%M')}"
 
-    # Healthy envelope for the user's age.
+    # Healthy envelope. V-2: read the AI-writable health_targets store first
+    # (which falls back to the age-derived seed when no AI row exists).
     age = _age_on(profile.birthday if profile is not None else None, target)
-    floor_min, ceil_min = _healthy_sleep_bounds_min(age)
+    from lattice.functions.health_targets import get_sleep_bounds_min
+    floor_min, ceil_min, floor_source, ceil_source = await get_sleep_bounds_min(
+        session, age=age,
+    )
 
     # Position inside the envelope from recovery debt (all signals).
     debt, recent_sleep_mean, debt_basis, n_signals = await _recovery_debt(
@@ -459,10 +471,19 @@ async def compute_sleep_window(
         bedtime = ideal_bedtime
         headline_duration = duration_min
 
-    # Caffeine cutoff (profile-overridable)
+    # Caffeine cutoff — Profile field still wins (explicit owner choice);
+    # otherwise read the AI-writable health_targets store, which falls back
+    # to the static 14:00 default when no AI row exists.
     cutoff_hour = DEFAULT_CAFFEINE_CUTOFF_HOUR
     if profile is not None and profile.caffeine_cutoff_hour is not None:
         cutoff_hour = profile.caffeine_cutoff_hour
+    else:
+        from lattice.functions.health_targets import (
+            CAFFEINE_CUTOFF_HOUR_KIND,
+            get_target,
+        )
+        cutoff_target = await get_target(session, CAFFEINE_CUTOFF_HOUR_KIND)
+        cutoff_hour = int(round(cutoff_target.value))
 
     flags: list[str] = []
     age_txt = f" for age {age}" if age is not None else ""

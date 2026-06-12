@@ -191,6 +191,88 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_health_targets",
+            "description": (
+                "Inspect the active personalized health targets you (the AI) own: "
+                "sleep_floor_min, sleep_ceiling_min, caffeine_daily_cap_mg, "
+                "caffeine_bedtime_residual_mg, caffeine_cutoff_hour. Each comes "
+                "with `source` ('ai' = you set it, 'default' = age-derived seed), "
+                "current value, your prior rationale, and the outer safety bounds "
+                "your next `set_health_targets` write will be clamped to."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_health_targets",
+            "description": (
+                "Persist one or more personalized health targets (V — the AI "
+                "decides how this user's targets should look, given age + "
+                "observed data, instead of the static age-bracket table). "
+                "Allowed kinds: sleep_floor_min, sleep_ceiling_min, "
+                "caffeine_daily_cap_mg, caffeine_bedtime_residual_mg, "
+                "caffeine_cutoff_hour. Each value is clamped to wide, "
+                "age-appropriate outer bounds (see `get_health_targets`); "
+                "clamping is logged + appended to the rationale automatically. "
+                "Cite the data motivating the change in the rationale "
+                "('HRV trending down past 4 weeks despite 8h average → raising "
+                "sleep_floor_min to 510')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "sleep_floor_min",
+                                        "sleep_ceiling_min",
+                                        "caffeine_daily_cap_mg",
+                                        "caffeine_bedtime_residual_mg",
+                                        "caffeine_cutoff_hour",
+                                    ],
+                                },
+                                "value": {
+                                    "type": "number",
+                                    "description": (
+                                        "Minutes for sleep_*_min, mg for "
+                                        "caffeine_*_mg, local hour 0-23 for "
+                                        "caffeine_cutoff_hour."
+                                    ),
+                                },
+                            },
+                            "required": ["kind", "value"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": (
+                            "One-line reason citing the data that motivates "
+                            "this change — shown next to the target on every "
+                            "surface."
+                        ),
+                    },
+                },
+                "required": ["targets"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_caffeine_status",
             "description": "F5 — caffeine residual at bedtime + 'last call' minutes.",
             "parameters": {

@@ -1,7 +1,12 @@
 """Sleep debt calculator.
 
-Computes cumulative sleep deficit vs the user's target (from profile, or 450 min
-/ 7.5h fallback) over a rolling window.
+Computes cumulative sleep deficit vs the user's age-aware healthy floor.
+
+Coherence (P1-2 / Rework R): sleep_debt and F4 must agree on what "below
+target" means. Both now use `_healthy_sleep_bounds_min(age)` as the floor
+(teens 8 h, adults 7 h, etc.), with `Profile.target_sleep_min` as an explicit
+override. The old flat 450-min fallback is gone — without an override or a
+birthday, sleep_debt falls back to the adult 7 h floor exactly like F4.
 """
 
 from __future__ import annotations
@@ -13,9 +18,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lattice.functions.baselines import metric_for_day_range
+from lattice.functions.sleep_window import _age_on
 from lattice.models import Profile
-
-FALLBACK_TARGET_MIN = 450  # 7.5 h
 
 
 async def compute_sleep_debt(
@@ -47,7 +51,15 @@ async def compute_sleep_debt(
         target_min: int = profile.target_sleep_min
         profile_target_used = True
     else:
-        target_min = FALLBACK_TARGET_MIN
+        # V-2: read the AI-writable sleep floor (defaults to F4's age-aware
+        # seed when no AI row exists). Both tools now answer "below target"
+        # the same way.
+        age = _age_on(profile.birthday if profile is not None else None, today)
+        from lattice.functions.health_targets import get_sleep_bounds_min
+        floor_min, _ceil, _floor_src, _ceil_src = await get_sleep_bounds_min(
+            session, age=age,
+        )
+        target_min = int(floor_min)
         profile_target_used = False
 
     rows = await metric_for_day_range(session, "sleep_duration_min", start, today, tz)
