@@ -21,12 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lattice.auth import require_auth
 from lattice.db import get_session
 from lattice.functions.routine_runner import run_routine
-from lattice.models import Routine
+from lattice.models import Routine, RoutineRun
 from lattice.schemas.routine import (
     RoutineIn,
     RoutineListResponse,
     RoutineOut,
     RoutinePatch,
+    RoutineRunListResponse,
+    RoutineRunOut,
 )
 from lattice.sync import scheduler
 
@@ -63,6 +65,22 @@ async def list_routines(
     return RoutineListResponse(
         items=[RoutineOut.from_row(r) for r in rows], total=int(total),
     )
+
+
+@router.get("/runs", response_model=RoutineRunListResponse)
+async def list_routine_runs(
+    limit: int = 20,
+    session: AsyncSession = Depends(get_session),
+) -> RoutineRunListResponse:
+    """Recent routine executions, newest first (P3-2)."""
+    limit = max(1, min(limit, 100))
+    stmt = (
+        select(RoutineRun)
+        .order_by(RoutineRun.fired_at.desc(), RoutineRun.id.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    return RoutineRunListResponse(items=[RoutineRunOut.model_validate(r) for r in rows])
 
 
 @router.post("", response_model=RoutineOut, status_code=status.HTTP_201_CREATED)

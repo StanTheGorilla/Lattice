@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lattice.integrations.discord_dm import send_dm
-from lattice.models import Routine
+from lattice.models import Routine, RoutineRun
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class RoutineRunResult:
     sent: bool
     suppressed: bool = False  # ai_review only_notable hit the sentinel
     detail: str = ""
+    reply_excerpt: str | None = None  # short preview for history surfaces (P3-2)
 
 
 def _is_sentinel(reply: str) -> bool:
@@ -75,17 +76,40 @@ async def _send_chunks(text: str) -> bool:
     return ok
 
 
-async def run_routine(session: AsyncSession, routine: Routine) -> RoutineRunResult:
-    """Run one routine now and record `last_run_at`. Caller commits."""
-    routine.last_run_at = datetime.now(UTC).isoformat(timespec="seconds")
+def _record_run(session: AsyncSession, fired_at: str, result: RoutineRunResult) -> None:
+    """Stage a RoutineRun history row (P3-2). Caller commits."""
+    session.add(
+        RoutineRun(
+            routine_id=result.routine_id,
+            fired_at=fired_at,
+            sent=result.sent,
+            suppressed=result.suppressed,
+            reply_excerpt=result.reply_excerpt,
+            detail=result.detail or None,
+        ),
+    )
 
+
+async def run_routine(session: AsyncSession, routine: Routine) -> RoutineRunResult:
+    """Run one routine now and record `last_run_at` + a RoutineRun row. Caller commits."""
+    fired_at = datetime.now(UTC).isoformat(timespec="seconds")
+    routine.last_run_at = fired_at
+    result = await _run_routine_inner(session, routine)
+    _record_run(session, fired_at, result)
+    return result
+
+
+async def _run_routine_inner(session: AsyncSession, routine: Routine) -> RoutineRunResult:
     if routine.type == "reminder":
         text = (routine.reminder_text or "").strip()
         if not text:
             return RoutineRunResult(routine.id, routine.type, sent=False,
                                     detail="empty reminder_text")
         sent = await send_dm(text)
-        return RoutineRunResult(routine.id, routine.type, sent=sent)
+        return RoutineRunResult(
+            routine.id, routine.type, sent=sent,
+            reply_excerpt=text[:200],
+        )
 
     # ai_review
     instruction = (routine.instruction or "").strip()
@@ -105,10 +129,16 @@ async def run_routine(session: AsyncSession, routine: Routine) -> RoutineRunResu
 
     if only_notable and _is_sentinel(reply):
         logger.info("routine %s (%s): nothing notable — suppressed", routine.id, routine.name)
-        return RoutineRunResult(routine.id, routine.type, sent=False, suppressed=True)
+        return RoutineRunResult(
+            routine.id, routine.type, sent=False, suppressed=True,
+            reply_excerpt=NOTABLE_SENTINEL,
+        )
 
     sent = await _send_chunks(reply)
-    return RoutineRunResult(routine.id, routine.type, sent=sent)
+    return RoutineRunResult(
+        routine.id, routine.type, sent=sent,
+        reply_excerpt=reply[:200] if reply else None,
+    )
 
 
 __all__ = [

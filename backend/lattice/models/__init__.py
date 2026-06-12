@@ -34,6 +34,7 @@ from lattice.models.sleep_stage import SleepStage  # noqa: E402, F401
 from lattice.models.custom_algorithm import CustomAlgorithm  # noqa: E402, F401
 from lattice.models.dashboard_card import DashboardCard  # noqa: E402, F401
 from lattice.models.routine import Routine  # noqa: E402, F401
+from lattice.models.routine_run import RoutineRun  # noqa: E402, F401
 from lattice.models.user_memory import UserMemory  # noqa: E402, F401
 from lattice.models.weekly_report import WeeklyReport  # noqa: E402, F401
 from lattice.models.workout import Workout  # noqa: E402, F401
@@ -60,6 +61,7 @@ __all__ = [
     "Profile",
     "Recommendation",
     "Routine",
+    "RoutineRun",
     "SleepStage",
     "UserMemory",
     "WeeklyReport",

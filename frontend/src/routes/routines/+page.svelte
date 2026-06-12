@@ -4,11 +4,18 @@
 	import Button from '$lib/components/ui/Button.svelte';
 	import { routinesApi } from '$lib/api/client';
 	import { toast } from '$lib/toast.svelte';
-	import type { Routine, RoutineInput, RoutineType, Chattiness } from '$lib/api/types';
+	import type {
+		Routine,
+		RoutineInput,
+		RoutineType,
+		Chattiness,
+		RoutineRun
+	} from '$lib/api/types';
 
 	const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 	let items = $state<Routine[]>([]);
+	let runs = $state<RoutineRun[]>([]);
 	let error = $state<string | null>(null);
 
 	// form state
@@ -31,9 +38,29 @@
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
+		try {
+			const r = await routinesApi.runs(15);
+			runs = r.items;
+		} catch {
+			// run history is non-critical; ignore failures
+		}
 	}
 
 	onMount(load);
+
+	function routineName(id: number): string {
+		return items.find((r) => r.id === id)?.name ?? `#${id}`;
+	}
+
+	function fmtFired(iso: string): string {
+		return iso.slice(0, 16).replace('T', ' ');
+	}
+
+	function runStatus(run: RoutineRun): { label: string; cls: string } {
+		if (run.suppressed) return { label: 'nothing notable', cls: 'quiet' };
+		if (run.sent) return { label: 'sent', cls: 'ok' };
+		return { label: 'not sent', cls: 'off' };
+	}
 
 	function maskFromDays(d: boolean[]): number {
 		return d.reduce((acc, on, i) => (on ? acc | (1 << i) : acc), 0);
@@ -236,6 +263,26 @@
 					</div>
 				</Card>
 			{/each}
+		{/if}
+
+		{#if runs.length > 0}
+			<Card eyebrow="Recent runs">
+				<ul class="runs">
+					{#each runs as run (run.id)}
+						{@const st = runStatus(run)}
+						<li class="run">
+							<div class="run-head">
+								<span class="run-time">{fmtFired(run.fired_at)}</span>
+								<span class="run-name">{routineName(run.routine_id)}</span>
+								<span class="badge {st.cls}">{st.label}</span>
+							</div>
+							{#if run.reply_excerpt && !run.suppressed}
+								<p class="run-excerpt">{run.reply_excerpt}</p>
+							{/if}
+						</li>
+					{/each}
+				</ul>
+			</Card>
 		{/if}
 	</div>
 
@@ -543,5 +590,50 @@
 	.form-actions {
 		display: flex;
 		gap: 8px;
+	}
+	.runs {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.run {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		padding-bottom: 10px;
+		border-bottom: 1px solid var(--color-border);
+	}
+	.run:last-child {
+		border-bottom: none;
+		padding-bottom: 0;
+	}
+	.run-head {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+	.run-time {
+		font-family: var(--font-mono, monospace);
+		font-size: 12px;
+		color: var(--color-fg-mute);
+	}
+	.run-name {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--color-fg);
+	}
+	.run-excerpt {
+		margin: 0;
+		font-size: 12px;
+		color: var(--color-fg-dim);
+		line-height: 1.4;
+	}
+	.badge.ok {
+		color: var(--color-accent);
+		border-color: var(--color-accent);
 	}
 </style>

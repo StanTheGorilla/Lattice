@@ -57,6 +57,24 @@ class RoutineListResponse(BaseModel):
     total: int
 
 
+class RoutineRunOut(BaseModel):
+    """One historical routine execution (P3-2)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    routine_id: int
+    fired_at: str
+    sent: bool
+    suppressed: bool
+    reply_excerpt: str | None
+    detail: str | None
+
+
+class RoutineRunListResponse(BaseModel):
+    items: list[RoutineRunOut]
+
+
 class RoutineIn(BaseModel):
     """Create/replace payload. `reminder` needs `reminder_text`; `ai_review`
     needs `instruction`. Validated below so the API and chat tool reject
@@ -104,5 +122,7 @@ __all__ = [
     "RoutineListResponse",
     "RoutineOut",
     "RoutinePatch",
+    "RoutineRunListResponse",
+    "RoutineRunOut",
     "RoutineType",
 ]
