@@ -151,6 +151,16 @@ export const fns = {
 		request<TrainingRecOutput>(`/functions/training_recommendation${qs({ date })}`),
 	sleepWindow: (date?: string) =>
 		request<SleepWindowOutput>(`/functions/sleep_window${qs({ date })}`),
+	sleepWindowFormula: (date?: string) =>
+		request<SleepWindowOutput>(`/functions/sleep_window/formula${qs({ date })}`),
+	regenerateSleepWindow: (date?: string) =>
+		request<SleepWindowOutput>(`/functions/sleep_window/regenerate${qs({ date })}`, {
+			method: 'POST'
+		}),
+	revertSleepWindow: (date?: string) =>
+		request<SleepWindowOutput>(`/functions/sleep_window/revert${qs({ date })}`, {
+			method: 'POST'
+		}),
 	caffeineStatus: (at?: string) =>
 		request<CaffeineStatusOutput>(`/functions/caffeine_status${qs({ at })}`),
 	advisor: (intent: AdvisorIntent, date?: string) =>
@@ -315,13 +325,36 @@ export const nutritionApi = {
 
 // ---------- chat ----------
 
-import type { ChatResponse } from './types';
+import type { AlgorithmRow, ChatResponse } from './types';
 
 export const chatApi = {
 	send: (session_id: string, message: string) =>
 		request<ChatResponse>('/chat', {
 			method: 'POST',
 			body: JSON.stringify({ session_id, message })
+		})
+};
+
+// ---------- algorithms (Phase 2L-a) ----------
+
+export const algorithmsApi = {
+	list: () => request<AlgorithmRow[]>('/algorithms'),
+	remove: (name: string) =>
+		request<void>(`/algorithms/${encodeURIComponent(name)}`, { method: 'DELETE' })
+};
+
+// ---------- dashboard cards (Phase 2L-c) ----------
+
+import type { DashboardCard, DashboardCardListResponse } from './types';
+
+export const dashboardApi = {
+	listCards: () => request<DashboardCardListResponse>('/dashboard/cards'),
+	deleteCard: (id: number) =>
+		request<void>(`/dashboard/cards/${id}`, { method: 'DELETE' }),
+	moveCard: (id: number, direction: 'up' | 'down') =>
+		request<DashboardCard>(`/dashboard/cards/${id}/move`, {
+			method: 'PATCH',
+			body: JSON.stringify({ direction })
 		})
 };
 
@@ -362,8 +395,36 @@ export const alertsApi = {
 	patchRule: (id: number, body: Record<string, unknown>) =>
 		request<AlertRuleOut>(`/alerts/rules/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
 	deleteRule: (id: number) => request<void>(`/alerts/rules/${id}`, { method: 'DELETE' }),
+	checkNow: () => request<{ fired: number }>('/alerts/check', { method: 'POST' }),
 	listEvents: (limit?: number) =>
 		request<AlertEventOut[]>(`/alerts/events${qs({ limit })}`)
+};
+
+// ---------- persistent memory ----------
+
+import type { Memory, MemoryListResponse } from './types';
+
+export const memoryApi = {
+	list: () => request<MemoryListResponse>('/memory'),
+	create: (content: string) =>
+		request<Memory>('/memory', { method: 'POST', body: JSON.stringify({ content }) }),
+	patch: (id: number, content: string) =>
+		request<Memory>(`/memory/${id}`, { method: 'PATCH', body: JSON.stringify({ content }) }),
+	remove: (id: number) => request<void>(`/memory/${id}`, { method: 'DELETE' })
+};
+
+// ---------- routines (Phase B) ----------
+
+import type { Routine, RoutineInput, RoutineListResponse } from './types';
+
+export const routinesApi = {
+	list: () => request<RoutineListResponse>('/routines'),
+	create: (body: RoutineInput) =>
+		request<Routine>('/routines', { method: 'POST', body: JSON.stringify(body) }),
+	patch: (id: number, body: Partial<RoutineInput>) =>
+		request<Routine>(`/routines/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+	remove: (id: number) => request<void>(`/routines/${id}`, { method: 'DELETE' }),
+	run: (id: number) => request<Routine>(`/routines/${id}/run`, { method: 'POST' })
 };
 
 // ---------- reports (F7 weekly) ----------

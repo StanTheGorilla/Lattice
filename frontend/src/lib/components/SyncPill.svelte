@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { scale } from 'svelte/transition';
 	import { sync, calendar, ApiError, type GarminStreamEvent } from '$lib/api/client';
 	import { toast } from '$lib/toast.svelte';
 
@@ -188,7 +189,13 @@
 	</button>
 
 	{#if open}
-		<div class="popover" bind:this={popoverEl} role="dialog" aria-label="Sync controls">
+		<div
+			class="popover"
+			bind:this={popoverEl}
+			role="dialog"
+			aria-label="Sync controls"
+			transition:scale={{ start: 0.96, duration: 160 }}
+		>
 			<header>
 				<span class="title">SYNC</span>
 				<button class="x" type="button" onclick={close} disabled={syncing}>×</button>
@@ -338,10 +345,9 @@
 		border-radius: var(--r-md);
 		padding: 16px;
 		z-index: 30;
-		box-shadow:
-			0 -2px 0 rgba(0, 0, 0, 0.05),
-			0 12px 32px rgba(0, 0, 0, 0.5);
+		box-shadow: var(--shadow-lg);
 		font-size: 12.5px;
+		transform-origin: bottom left;
 	}
 	header {
 		display: flex;

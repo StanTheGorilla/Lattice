@@ -43,12 +43,16 @@
 		font-size: 13px;
 		line-height: 1;
 		outline: none;
-		transition: border-color 120ms;
+		transition:
+			border-color var(--t-fast) var(--ease),
+			box-shadow var(--t-fast) var(--ease),
+			background var(--t-fast) var(--ease);
 		width: 100%;
 	}
 	.input:focus {
 		border-color: var(--color-accent);
 		background: var(--color-bg-1);
+		box-shadow: var(--ring);
 	}
 	.input::placeholder {
 		color: var(--color-fg-dim);

@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
+	import { fade, fly } from 'svelte/transition';
 	import { auth } from '$lib/api/client';
 	import SyncPill from '$lib/components/SyncPill.svelte';
 	import Toaster from '$lib/components/Toaster.svelte';
@@ -14,16 +15,23 @@
 	}
 
 	const NAV = [
-		{ href: '/', label: 'Today', key: 'T' },
-		{ href: '/trends', label: 'Trends', key: 'R' },
-		{ href: '/log', label: 'Log', key: 'L' },
-		{ href: '/habits', label: 'Habits', key: 'H' },
-		{ href: '/report', label: 'Report', key: 'W' },
-		{ href: '/protocol', label: 'Protocol', key: 'P' },
-		{ href: '/research', label: 'Research', key: 'E' },
-		{ href: '/chat', label: 'Chat', key: 'C' },
-		{ href: '/settings', label: 'Settings', key: 'S' }
+		{ href: '/', label: 'Today', key: 'T', section: 'primary' },
+		{ href: '/trends', label: 'Trends', key: 'R', section: 'primary' },
+		{ href: '/log', label: 'Log', key: 'L', section: 'primary' },
+		{ href: '/habits', label: 'Habits', key: 'H', section: 'primary' },
+		{ href: '/routines', label: 'Routines', key: 'O', section: 'primary' },
+		{ href: '/chat', label: 'Chat', key: 'C', section: 'primary' },
+		{ href: '/report', label: 'Report', key: 'W', section: 'more' },
+		{ href: '/protocol', label: 'Protocol', key: 'P', section: 'more' },
+		{ href: '/research', label: 'Research', key: 'E', section: 'more' },
+		{ href: '/memory', label: 'Memory', key: 'M', section: 'more' },
+		{ href: '/algorithms', label: 'Algorithms', key: 'A', section: 'more' },
+		{ href: '/alerts', label: 'Alerts', key: 'N', section: 'more' },
+		{ href: '/settings', label: 'Settings', key: 'S', section: 'more' }
 	];
+
+	const NAV_PRIMARY = NAV.filter((n) => n.section === 'primary');
+	const NAV_MORE = NAV.filter((n) => n.section === 'more');
 
 	let authChecked = $state(false);
 	let permissive = $state(false);
@@ -95,7 +103,19 @@
 			</div>
 
 			<nav class="nav">
-				{#each NAV as item (item.href)}
+				{#each NAV_PRIMARY as item (item.href)}
+					<a
+						class="nav-item"
+						class:active={page.url.pathname === item.href ||
+							(item.href !== '/' && page.url.pathname.startsWith(item.href))}
+						href={item.href}
+					>
+						<span class="nav-label">{item.label}</span>
+						<span class="nav-key">{item.key}</span>
+					</a>
+				{/each}
+				<div class="nav-divider">More</div>
+				{#each NAV_MORE as item (item.href)}
 					<a
 						class="nav-item"
 						class:active={page.url.pathname === item.href ||
@@ -130,9 +150,27 @@
 
 		<!-- Mobile nav drawer -->
 		{#if mobileNavOpen}
-			<div class="mobile-overlay" onclick={() => { mobileNavOpen = false; }} role="presentation"></div>
-			<nav class="mobile-drawer">
-				{#each NAV as item (item.href)}
+			<div
+				class="mobile-overlay"
+				onclick={() => { mobileNavOpen = false; }}
+				role="presentation"
+				transition:fade={{ duration: 160 }}
+			></div>
+			<nav class="mobile-drawer" transition:fly={{ x: 280, duration: 240, opacity: 1 }}>
+				{#each NAV_PRIMARY as item (item.href)}
+					<a
+						class="nav-item"
+						class:active={page.url.pathname === item.href ||
+							(item.href !== '/' && page.url.pathname.startsWith(item.href))}
+						href={item.href}
+						onclick={() => { mobileNavOpen = false; }}
+					>
+						<span class="nav-label">{item.label}</span>
+						<span class="nav-key">{item.key}</span>
+					</a>
+				{/each}
+				<div class="nav-divider">More</div>
+				{#each NAV_MORE as item (item.href)}
 					<a
 						class="nav-item"
 						class:active={page.url.pathname === item.href ||
@@ -152,9 +190,11 @@
 		{/if}
 
 		<main>
-			<div class="container">
-				{@render children()}
-			</div>
+			{#key page.url.pathname}
+				<div class="container page-enter">
+					{@render children()}
+				</div>
+			{/key}
 		</main>
 	</div>
 {/if}
@@ -213,6 +253,16 @@
 		flex-direction: column;
 		padding: 0 12px;
 		gap: 2px;
+	}
+	.nav-divider {
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		text-transform: uppercase;
+		letter-spacing: 0.14em;
+		color: var(--color-fg-faint);
+		padding: 14px 12px 6px;
+		margin-top: 4px;
+		border-top: 1px solid var(--color-border);
 	}
 	.nav-item {
 		display: flex;
@@ -324,6 +374,9 @@
 	.container {
 		max-width: 1400px;
 		margin: 0 auto;
+	}
+	.page-enter {
+		animation: fade-up var(--t-med) var(--ease) both;
 	}
 	@media (max-width: 900px) {
 		main {

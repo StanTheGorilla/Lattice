@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { fly } from 'svelte/transition';
 	import { toast } from '$lib/toast.svelte';
 </script>
 
@@ -9,6 +10,7 @@
 			onclick={() => toast.dismiss(t.id)}
 			title="dismiss"
 			type="button"
+			transition:fly={{ y: 8, duration: 200 }}
 		>
 			<span class="msg">{t.message}</span>
 			<span class="x">×</span>
@@ -42,8 +44,7 @@
 		font-size: 12.5px;
 		cursor: pointer;
 		text-align: left;
-		box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-		animation: in 160ms ease-out;
+		box-shadow: var(--shadow-lg);
 	}
 	.toast.error {
 		border-color: rgba(201, 106, 106, 0.45);
@@ -58,15 +59,5 @@
 		color: var(--color-fg-faint);
 		font-size: 14px;
 		line-height: 1;
-	}
-	@keyframes in {
-		from {
-			opacity: 0;
-			transform: translateY(4px);
-		}
-		to {
-			opacity: 1;
-			transform: translateY(0);
-		}
 	}
 </style>

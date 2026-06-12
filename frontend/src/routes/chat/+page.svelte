@@ -1,12 +1,34 @@
 <script lang="ts">
 	import { tick } from 'svelte';
+	import { fly } from 'svelte/transition';
 	import { chatApi } from '$lib/api/client';
 	import type { ChatMessage } from '$lib/api/types';
 
-	let messages = $state<(ChatMessage & { tools?: string[]; actions?: string[] })[]>([]);
+	type ChatMsg = ChatMessage & {
+		tools?: { name: string; ok: boolean }[];
+		actions?: string[];
+	};
+
+	// crypto.randomUUID() only exists in secure contexts (HTTPS/localhost). On a
+	// plain-HTTP LAN address (http://<pi-ip>:8000) it's undefined and throws,
+	// which would break the whole page at init. getRandomValues IS available in
+	// insecure contexts, so fall back to it; Math.random as a last resort.
+	function newSessionId(): string {
+		const c = globalThis.crypto;
+		if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+		const bytes = new Uint8Array(16);
+		if (c && typeof c.getRandomValues === 'function') {
+			c.getRandomValues(bytes);
+		} else {
+			for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+		}
+		return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+	}
+
+	let messages = $state<ChatMsg[]>([]);
 	let input = $state('');
 	let sending = $state(false);
-	let sessionId = $state<string>(crypto.randomUUID());
+	let sessionId = $state<string>(newSessionId());
 	let bottomEl: HTMLDivElement | undefined = $state();
 	let inputEl: HTMLTextAreaElement | undefined = $state();
 
@@ -17,6 +39,7 @@
 		messages = [...messages, { role: 'user', content: text }];
 		sending = true;
 		await tick();
+		autogrow();
 		bottomEl?.scrollIntoView({ behavior: 'smooth' });
 		try {
 			const res = await chatApi.send(sessionId, text);
@@ -26,7 +49,7 @@
 				{
 					role: 'assistant',
 					content: res.reply,
-					tools: res.tool_calls,
+					tools: res.tool_calls.map((tc) => ({ name: tc.name, ok: tc.ok })),
 					actions: res.actions_taken
 				}
 			];
@@ -48,6 +71,12 @@
 			e.preventDefault();
 			send();
 		}
+	}
+
+	function autogrow() {
+		if (!inputEl) return;
+		inputEl.style.height = 'auto';
+		inputEl.style.height = `${Math.min(inputEl.scrollHeight, 160)}px`;
 	}
 
 	function renderMarkdown(md: string): string {
@@ -103,14 +132,14 @@
 		{/if}
 
 		{#each messages as msg, i (i)}
-			<div class="message {msg.role}">
+			<div class="message {msg.role}" in:fly={{ y: 8, duration: 200 }}>
 				{#if msg.role === 'user'}
 					<div class="bubble user-bubble">{msg.content}</div>
 				{:else}
 					{#if msg.tools && msg.tools.length > 0}
 						<div class="tools-row">
-							{#each msg.tools as t (t)}
-								<span class="tool-chip">{t}</span>
+							{#each msg.tools as t (t.name)}
+								<span class="tool-chip" class:tool-fail={!t.ok}>{t.name}</span>
 							{/each}
 						</div>
 					{/if}
@@ -129,7 +158,7 @@
 		{/each}
 
 		{#if sending}
-			<div class="message assistant">
+			<div class="message assistant" in:fly={{ y: 8, duration: 200 }}>
 				<div class="bubble assistant-bubble thinking">
 					<span class="dot"></span><span class="dot"></span><span class="dot"></span>
 				</div>
@@ -144,6 +173,7 @@
 			bind:this={inputEl}
 			bind:value={input}
 			onkeydown={onKeydown}
+			oninput={autogrow}
 			placeholder="Message… (Enter to send, Shift+Enter for newline)"
 			rows="1"
 			disabled={sending}
@@ -278,6 +308,12 @@
 		color: var(--color-accent);
 		font-family: var(--font-mono);
 	}
+	.tool-chip.tool-fail {
+		opacity: 0.55;
+		border-color: rgba(201, 106, 106, 0.3);
+		color: #c96a6a;
+		background: rgba(201, 106, 106, 0.08);
+	}
 	.action-chip {
 		font-size: 10px;
 		padding: 2px 7px;
@@ -333,7 +369,10 @@
 		overflow-y: auto;
 		line-height: 1.5;
 	}
-	textarea:focus { border-color: var(--color-accent); }
+	textarea:focus {
+		border-color: var(--color-accent);
+		box-shadow: var(--ring);
+	}
 	textarea::placeholder { color: var(--color-fg-dim); }
 	.send-btn {
 		width: 40px;
@@ -346,7 +385,16 @@
 		font-weight: 700;
 		cursor: pointer;
 		flex-shrink: 0;
-		transition: opacity 120ms;
+		transition:
+			opacity var(--t-fast) var(--ease),
+			background var(--t-fast) var(--ease),
+			transform var(--t-fast) var(--ease);
+	}
+	.send-btn:hover:not(:disabled) {
+		background: #74d8d1;
+	}
+	.send-btn:active:not(:disabled) {
+		transform: scale(0.94);
 	}
 	.send-btn:disabled {
 		opacity: 0.35;

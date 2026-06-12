@@ -73,8 +73,9 @@
 		padding: 36px 32px 28px;
 		background: var(--color-bg-1);
 		border: 1px solid var(--color-border);
-		border-radius: var(--r-md);
-		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+		border-radius: var(--r-lg);
+		box-shadow: var(--shadow-lg);
+		animation: fade-up var(--t-med) var(--ease) both;
 	}
 	.brand {
 		display: flex;
@@ -128,6 +129,7 @@
 	.input:focus {
 		border-color: var(--color-accent);
 		background: var(--color-bg-1);
+		box-shadow: var(--ring);
 	}
 	.input::placeholder {
 		color: var(--color-fg-dim);

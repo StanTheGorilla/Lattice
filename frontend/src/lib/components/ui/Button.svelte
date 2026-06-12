@@ -33,7 +33,16 @@
 		background: var(--color-bg-2);
 		font-weight: 500;
 		cursor: pointer;
-		transition: background 120ms, border-color 120ms;
+		transition:
+			background var(--t-fast) var(--ease),
+			border-color var(--t-fast) var(--ease),
+			transform var(--t-fast) var(--ease);
+	}
+	.btn:active:not(:disabled) {
+		transform: scale(0.97);
+	}
+	.btn:focus-visible {
+		box-shadow: var(--ring);
 	}
 	.size-md {
 		height: 32px;

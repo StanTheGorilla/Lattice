@@ -36,13 +36,19 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--s-4);
-		transition: border-color 120ms ease;
+		box-shadow: var(--shadow-sm);
+		transition:
+			border-color var(--t-fast) var(--ease),
+			box-shadow var(--t-fast) var(--ease),
+			transform var(--t-fast) var(--ease);
 	}
 	.card.padded {
 		padding: var(--s-5);
 	}
 	.card:hover {
 		border-color: var(--color-border-strong);
+		box-shadow: var(--shadow-md);
+		transform: translateY(-1px);
 	}
 	.head {
 		display: flex;

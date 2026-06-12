@@ -1,13 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { planning } from '$lib/api/client';
-	import type { AreaOut, DecisionOut, InitiativeOut, PlanOut } from '$lib/api/types';
+	import type { AIRuleOut, AreaOut, DecisionOut, InitiativeOut, PlanOut } from '$lib/api/types';
 	import Pill from '$lib/components/ui/Pill.svelte';
+	import Button from '$lib/components/ui/Button.svelte';
+	import { toast } from '$lib/toast.svelte';
 
 	let plans = $state<PlanOut[]>([]);
 	let areas = $state<AreaOut[]>([]);
 	let initiatives = $state<InitiativeOut[]>([]);
 	let decisions = $state<DecisionOut[]>([]);
+	let rules = $state<AIRuleOut[]>([]);
 	let loading = $state(true);
 
 	// expanded plan body
@@ -16,13 +19,34 @@
 	// status action in flight
 	let actioning = $state<number | null>(null);
 
-	onMount(async () => {
-		[plans, areas, initiatives, decisions] = await Promise.all([
+	// ── create-form state ──
+	let addInitForArea = $state<number | null>(null); // area id the init form is open for
+	let initTitle = $state('');
+	let initWhy = $state('');
+	let initTargetDate = $state('');
+	let savingInit = $state(false);
+
+	let showAddArea = $state(false);
+	let areaName_ = $state('');
+	let areaKey = $state('');
+	let savingArea = $state(false);
+
+	let showAddRule = $state(false);
+	let ruleText = $state('');
+	let savingRule = $state(false);
+
+	async function loadAll() {
+		[plans, areas, initiatives, decisions, rules] = await Promise.all([
 			planning.listPlans(),
 			planning.listAreas(),
 			planning.listInitiatives(),
-			planning.listDecisions({ status: 'open' })
+			planning.listDecisions({ status: 'open' }),
+			planning.listRules()
 		]);
+	}
+
+	onMount(async () => {
+		await loadAll();
 		loading = false;
 	});
 
@@ -37,6 +61,100 @@
 	}
 
 	const activeInitCount = $derived(initiatives.filter((i) => i.status === 'active').length);
+
+	function openInitForm(areaId: number) {
+		addInitForArea = areaId;
+		initTitle = '';
+		initWhy = '';
+		initTargetDate = '';
+	}
+
+	async function submitInitiative(areaId: number) {
+		if (!initTitle.trim()) {
+			toast.error('title is required');
+			return;
+		}
+		savingInit = true;
+		try {
+			const created = await planning.createInitiative({
+				area_id: areaId,
+				title: initTitle.trim(),
+				why: initWhy.trim() || undefined,
+				target_date: initTargetDate || undefined
+			});
+			initiatives = [...initiatives, created];
+			addInitForArea = null;
+			toast.info('initiative added');
+		} catch (e) {
+			toast.error('add failed: ' + (e instanceof Error ? e.message : String(e)));
+		} finally {
+			savingInit = false;
+		}
+	}
+
+	function slugify(s: string): string {
+		return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+	}
+
+	async function submitArea() {
+		const name = areaName_.trim();
+		if (!name) {
+			toast.error('name is required');
+			return;
+		}
+		const key = (areaKey.trim() || slugify(name)).slice(0, 32);
+		savingArea = true;
+		try {
+			const created = await planning.createArea({ key, name });
+			areas = [...areas, created];
+			showAddArea = false;
+			areaName_ = '';
+			areaKey = '';
+			toast.info('area added');
+		} catch (e) {
+			toast.error('add failed: ' + (e instanceof Error ? e.message : String(e)));
+		} finally {
+			savingArea = false;
+		}
+	}
+
+	async function submitRule() {
+		if (!ruleText.trim()) {
+			toast.error('rule text is required');
+			return;
+		}
+		savingRule = true;
+		try {
+			const created = await planning.createRule({ rule: ruleText.trim() });
+			rules = [...rules, created];
+			showAddRule = false;
+			ruleText = '';
+			toast.info('rule added');
+		} catch (e) {
+			toast.error('add failed: ' + (e instanceof Error ? e.message : String(e)));
+		} finally {
+			savingRule = false;
+		}
+	}
+
+	async function toggleRule(r: AIRuleOut) {
+		try {
+			const updated = await planning.patchRule(r.id, { active: !r.active });
+			rules = rules.map((x) => (x.id === r.id ? updated : x));
+		} catch (e) {
+			toast.error('update failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
+	}
+
+	async function removeRule(r: AIRuleOut) {
+		if (!confirm('delete this AI rule?')) return;
+		try {
+			await planning.deleteRule(r.id);
+			rules = rules.filter((x) => x.id !== r.id);
+		} catch (e) {
+			toast.error('delete failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
+	}
 
 	async function setStatus(init: InitiativeOut, newStatus: string) {
 		if (actioning === init.id) return;
@@ -124,44 +242,111 @@
 
 		<!-- ── Initiatives ── -->
 		<section class="section">
-			<div class="section-label">Initiatives</div>
+			<div class="section-head">
+				<div class="section-label">Initiatives</div>
+				<button class="link-btn" onclick={() => (showAddArea = !showAddArea)}>
+					{showAddArea ? 'cancel' : '+ area'}
+				</button>
+			</div>
+
+			{#if showAddArea}
+				<div class="add-form">
+					<input class="raw-input" bind:value={areaName_} placeholder="Area name (e.g. Health)" disabled={savingArea} />
+					<input class="raw-input key" bind:value={areaKey} placeholder="key (optional)" disabled={savingArea} />
+					<Button variant="primary" size="sm" onclick={submitArea} disabled={savingArea}>
+						{savingArea ? '…' : 'Add'}
+					</Button>
+				</div>
+			{/if}
 
 			{#if areas.length === 0}
-				<div class="empty-hint">No areas set up yet.</div>
+				<div class="empty-hint">No areas yet. Add one above to group your initiatives.</div>
 			{:else}
 				{#each areas as area (area.id)}
 					{@const inits = areaInits(area.id)}
-					{#if inits.length > 0}
-						<div class="area-block">
+					<div class="area-block">
+						<div class="area-head">
 							<div class="area-name">{area.name}</div>
-							{#each inits as init (init.id)}
-								<div class="init-row" class:paused={init.status === 'paused'}>
-									<div class="init-body">
-										<span class="init-title">{init.title}</span>
-										{#if init.why}
-											<span class="init-sub">{init.why}</span>
-										{/if}
-										{#if init.target_date}
-											<span class="init-date">by {init.target_date}</span>
-										{/if}
-									</div>
-									<div class="init-actions">
-										<Pill tone={statusTone(init.status)} size="sm">{init.status}</Pill>
-										{#if init.status === 'active'}
-											<button class="act" onclick={() => setStatus(init, 'paused')} disabled={actioning === init.id}>Pause</button>
-											<button class="act" onclick={() => setStatus(init, 'completed')} disabled={actioning === init.id}>Done</button>
-										{:else if init.status === 'paused'}
-											<button class="act accent" onclick={() => setStatus(init, 'active')} disabled={actioning === init.id}>Resume</button>
-											<button class="act" onclick={() => setStatus(init, 'abandoned')} disabled={actioning === init.id}>Drop</button>
-										{/if}
-									</div>
-								</div>
-							{/each}
+							<button class="link-btn" onclick={() => (addInitForArea === area.id ? (addInitForArea = null) : openInitForm(area.id))}>
+								{addInitForArea === area.id ? 'cancel' : '+ initiative'}
+							</button>
 						</div>
-					{/if}
+
+						{#each inits as init (init.id)}
+							<div class="init-row" class:paused={init.status === 'paused'}>
+								<div class="init-body">
+									<span class="init-title">{init.title}</span>
+									{#if init.why}
+										<span class="init-sub">{init.why}</span>
+									{/if}
+									{#if init.target_date}
+										<span class="init-date">by {init.target_date}</span>
+									{/if}
+								</div>
+								<div class="init-actions">
+									<Pill tone={statusTone(init.status)} size="sm">{init.status}</Pill>
+									{#if init.status === 'active'}
+										<button class="act" onclick={() => setStatus(init, 'paused')} disabled={actioning === init.id}>Pause</button>
+										<button class="act" onclick={() => setStatus(init, 'completed')} disabled={actioning === init.id}>Done</button>
+									{:else if init.status === 'paused'}
+										<button class="act accent" onclick={() => setStatus(init, 'active')} disabled={actioning === init.id}>Resume</button>
+										<button class="act" onclick={() => setStatus(init, 'abandoned')} disabled={actioning === init.id}>Drop</button>
+									{/if}
+								</div>
+							</div>
+						{/each}
+
+						{#if addInitForArea === area.id}
+							<div class="add-form col">
+								<input class="raw-input" bind:value={initTitle} placeholder="Initiative title" disabled={savingInit} />
+								<input class="raw-input" bind:value={initWhy} placeholder="Why it matters (optional)" disabled={savingInit} />
+								<div class="add-form">
+									<input class="raw-input" type="date" bind:value={initTargetDate} disabled={savingInit} />
+									<Button variant="primary" size="sm" onclick={() => submitInitiative(area.id)} disabled={savingInit}>
+										{savingInit ? '…' : 'Add initiative'}
+									</Button>
+								</div>
+							</div>
+						{:else if inits.length === 0}
+							<div class="area-empty">No active initiatives.</div>
+						{/if}
+					</div>
 				{/each}
 			{/if}
-			<div class="add-hint">Add initiatives in chat or via Settings → Areas.</div>
+		</section>
+
+		<!-- ── AI Rules ── -->
+		<section class="section">
+			<div class="section-head">
+				<div class="section-label">AI Rules</div>
+				<button class="link-btn" onclick={() => (showAddRule = !showAddRule)}>
+					{showAddRule ? 'cancel' : '+ rule'}
+				</button>
+			</div>
+			<div class="add-hint">Standing instructions the assistant follows in every conversation.</div>
+
+			{#if showAddRule}
+				<div class="add-form col">
+					<input class="raw-input" bind:value={ruleText} placeholder="e.g. Always use metric units" disabled={savingRule} />
+					<Button variant="primary" size="sm" onclick={submitRule} disabled={savingRule}>
+						{savingRule ? '…' : 'Add rule'}
+					</Button>
+				</div>
+			{/if}
+
+			{#if rules.length > 0}
+				<div class="rules">
+					{#each rules as r (r.id)}
+						<div class="rule-row" class:off={!r.active}>
+							<span class="rule-text">{r.rule}</span>
+							<div class="rule-actions">
+								<button class="act" onclick={() => toggleRule(r)}>{r.active ? 'mute' : 'enable'}</button>
+								<button class="act" onclick={() => removeRule(r)}>delete</button>
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
 		</section>
 
 		<!-- ── Open Decisions ── -->
@@ -216,6 +401,12 @@
 	.section {
 		margin-bottom: 36px;
 	}
+	.section-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 12px;
+	}
 	.section-label {
 		font-size: 11px;
 		font-weight: 700;
@@ -223,6 +414,97 @@
 		letter-spacing: 0.1em;
 		color: var(--color-fg-mute);
 		margin-bottom: 12px;
+	}
+	.section-head .section-label {
+		margin-bottom: 0;
+	}
+	.link-btn {
+		font-size: 11px;
+		color: var(--color-accent);
+		background: none;
+		border: 0;
+		padding: 0;
+		cursor: pointer;
+		transition: opacity 120ms;
+	}
+	.link-btn:hover {
+		opacity: 0.7;
+	}
+	.add-form {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin: 8px 0 14px;
+	}
+	.add-form.col {
+		flex-direction: column;
+		align-items: stretch;
+	}
+	.raw-input {
+		flex: 1;
+		padding: 7px 10px;
+		border: 1px solid var(--color-border);
+		border-radius: var(--r-sm);
+		background: var(--color-bg-2);
+		color: var(--color-fg);
+		font-size: 12.5px;
+		font-family: inherit;
+		outline: none;
+		transition: border-color 120ms, background 120ms;
+	}
+	.raw-input:focus {
+		border-color: var(--color-accent);
+		background: var(--color-bg-1);
+	}
+	.raw-input.key {
+		flex: 0 0 130px;
+		font-family: var(--font-mono);
+		font-size: 11.5px;
+	}
+	.area-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		margin-bottom: 6px;
+	}
+	.area-head .area-name {
+		margin-bottom: 0;
+	}
+	.area-empty {
+		font-size: 11.5px;
+		color: var(--color-fg-faint);
+		padding: 2px 0 6px 10px;
+	}
+	.rules {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.rule-row {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 7px 0 7px 10px;
+		border-left: 2px solid var(--color-border);
+		transition: border-color 120ms;
+	}
+	.rule-row:hover {
+		border-left-color: var(--color-accent);
+	}
+	.rule-row.off {
+		opacity: 0.45;
+	}
+	.rule-text {
+		flex: 1;
+		font-size: 12.5px;
+		color: var(--color-fg);
+		line-height: 1.4;
+	}
+	.rule-actions {
+		display: flex;
+		gap: 4px;
+		flex-shrink: 0;
 	}
 	.empty-hint {
 		font-size: 12.5px;

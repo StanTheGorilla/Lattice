@@ -137,6 +137,8 @@ export interface TrainingRecOutput {
 	inputs: Record<string, number | string | null>;
 }
 
+export type RecommendationSource = 'ai' | 'formula';
+
 export interface SleepWindowOutput {
 	date: string;
 	bedtime: string;
@@ -144,6 +146,9 @@ export interface SleepWindowOutput {
 	target_duration_min: number;
 	flags: string[];
 	inputs: Record<string, string | number | null>;
+	source: RecommendationSource;
+	rationale: string | null;
+	author: string | null;
 }
 
 export interface CaffeineStatusOutput {
@@ -420,12 +425,69 @@ export interface ChatMessage {
 	content: string;
 }
 
+export interface ToolCallSummary {
+	name: string;
+	arguments: Record<string, unknown>;
+	result: Record<string, unknown>;
+	ok: boolean;
+}
+
 export interface ChatResponse {
 	session_id: string;
 	reply: string;
-	tool_calls: string[];
+	tool_calls: ToolCallSummary[];
 	actions_taken: string[];
 	finish_reason: string;
+}
+
+// ---------- dashboard cards (Phase 2L-c) ----------
+
+export interface DashboardSeriesSpec {
+	name: string;
+	metric?: string;
+	value?: number;
+	color?: string;
+}
+
+export type DashboardChartType = 'line' | 'bar' | 'table';
+
+export interface ResolvedLineBar {
+	chart_type: 'line' | 'bar';
+	labels: string[];
+	series: { name: string; data: (number | null)[]; color?: string }[];
+}
+
+export interface ResolvedTable {
+	chart_type: 'table';
+	columns: string[];
+	rows: (string | number | null)[][];
+}
+
+export type ResolvedChart = ResolvedLineBar | ResolvedTable;
+
+export interface DashboardCard {
+	id: number;
+	title: string;
+	chart_type: DashboardChartType;
+	position: number;
+	created_at: string;
+	data_source: Record<string, unknown>;
+	resolved: ResolvedChart;
+}
+
+export interface DashboardCardListResponse {
+	items: DashboardCard[];
+}
+
+// ---------- algorithms (Phase 2L-a) ----------
+
+export interface AlgorithmRow {
+	id: number;
+	name: string;
+	description: string;
+	data_requirements: Record<string, unknown>;
+	created_at: string;
+	updated_at: string;
 }
 
 // ---------- F10 analytics ----------
@@ -526,4 +588,53 @@ export interface PlanOut {
 	progress_note: string | null;
 	created_at: string;
 	closed_at: string | null;
+}
+
+export interface Memory {
+	id: number;
+	content: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface MemoryListResponse {
+	items: Memory[];
+	total: number;
+}
+
+// ---------- routines (Phase B) ----------
+
+export type RoutineType = 'ai_review' | 'reminder';
+export type Chattiness = 'always' | 'only_notable';
+
+export interface Routine {
+	id: number;
+	name: string;
+	type: RoutineType;
+	hour: number;
+	minute: number;
+	weekday_mask: number;
+	instruction: string | null;
+	chattiness: Chattiness;
+	reminder_text: string | null;
+	enabled: boolean;
+	last_run_at: string | null;
+	created_at: string;
+}
+
+export interface RoutineInput {
+	name: string;
+	type: RoutineType;
+	hour: number;
+	minute: number;
+	weekday_mask: number;
+	instruction?: string | null;
+	chattiness: Chattiness;
+	reminder_text?: string | null;
+	enabled: boolean;
+}
+
+export interface RoutineListResponse {
+	items: Routine[];
+	total: number;
 }
