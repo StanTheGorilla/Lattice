@@ -6,6 +6,8 @@ Jobs registered (all gated by LATTICE_DISABLE_SCHEDULER):
   - weekly_report         : Sunday @ 22:00 — generate F7 for the current ISO week (2I)
   - conversation_prune    : daily @ 03:00 — trim conversations older than 30 days (2J)
   - calendar_cache_prune  : hourly @ :15 — drop events ending >1 day ago (2J)
+  - sqlite_backup         : daily @ 03:30 — `VACUUM INTO` a dated copy under
+                            `data/backups/`, keep 14 newest, prune older (P0-2)
 
 The scheduler is **disabled by default** in dev because `uvicorn --reload`
 spawns duplicate processes that would each run jobs. Set
@@ -27,7 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from lattice.config import settings
+from lattice.config import DATA_DIR, settings
 from lattice.db import SessionLocal
 from lattice.functions.alert_checker import run_alert_check
 from lattice.functions.readiness import compute_readiness
@@ -102,9 +104,16 @@ async def _readiness_compute_job() -> None:
 
 
 async def _conversation_prune_job() -> None:
-    """Trim `conversations` rows older than 30 days (SPEC §4.4)."""
+    """Trim `conversations` rows older than 30 days (SPEC §4.4).
+
+    P1-1: `Conversation.timestamp` is written in UTC (`datetime.now(UTC)` in
+    `api/chat.py`), so the cutoff used for lexicographic SQL comparison must
+    also be UTC. The previous local-offset cutoff drifted by ~the offset and
+    pruned a slightly different window on either side of DST changes.
+    """
+    from datetime import UTC
     try:
-        cutoff = (datetime.now(ZoneInfo(settings.timezone)) - timedelta(days=30)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
         async with SessionLocal() as session:
             result = await session.execute(
                 delete(Conversation).where(Conversation.timestamp < cutoff),
@@ -123,6 +132,56 @@ async def _calendar_cache_prune_job() -> None:
         logger.info("calendar cache prune: deleted %d rows", deleted)
     except Exception:  # noqa: BLE001
         logger.exception("calendar cache prune crashed")
+
+
+async def _sqlite_backup_job() -> None:
+    """Snapshot the SQLite DB to `data/backups/lattice-YYYYMMDD.db`, keep ~14.
+
+    Uses `VACUUM INTO`, which produces a defragmented, fully-self-contained copy
+    safe to take while the WAL-mode DB is in use. Older backups beyond the
+    retention window are pruned. SD-card corruption is the most common Pi
+    failure mode — without this job, a bad write loses all history.
+    """
+    import sqlite3
+
+    retention = 14
+    try:
+        backups_dir = DATA_DIR / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        db_path = DATA_DIR / "lattice.db"
+        if not db_path.exists():
+            logger.warning("sqlite backup: source db %s missing — skip", db_path)
+            return
+        today = datetime.now(ZoneInfo(settings.timezone)).date()
+        out_path = backups_dir / f"lattice-{today.isoformat()}.db"
+        tmp_path = backups_dir / f"lattice-{today.isoformat()}.db.tmp"
+        if tmp_path.exists():
+            tmp_path.unlink()
+        # VACUUM INTO requires an absolute path string; sqlite3 cannot overwrite,
+        # so we vacuum into a tmp file then atomically rename.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(f"VACUUM INTO '{tmp_path.as_posix()}'")
+        finally:
+            conn.close()
+        tmp_path.replace(out_path)
+        size_kb = out_path.stat().st_size / 1024
+        logger.info("sqlite backup wrote %s (%.0f KB)", out_path.name, size_kb)
+
+        # Prune: keep the `retention` newest matching files.
+        snapshots = sorted(
+            backups_dir.glob("lattice-*.db"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in snapshots[retention:]:
+            try:
+                stale.unlink()
+                logger.info("sqlite backup pruned %s", stale.name)
+            except OSError:
+                logger.exception("sqlite backup prune failed for %s", stale.name)
+    except Exception:  # noqa: BLE001
+        logger.exception("sqlite backup crashed")
 
 
 async def _alert_check_job() -> None:
@@ -312,11 +371,19 @@ def start() -> AsyncIOScheduler | None:
         max_instances=1,
         coalesce=True,
     )
+    sched.add_job(
+        _sqlite_backup_job,
+        trigger=CronTrigger(hour=3, minute=30),
+        id="sqlite_backup",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     sched.start()
     _scheduler = sched
     logger.info(
         "scheduler started (tz=%s) — jobs: garmin_sync, readiness_compute, weekly_report, "
-        "conversation_prune, calendar_cache_prune, alert_check",
+        "conversation_prune, calendar_cache_prune, alert_check, sqlite_backup",
         settings.timezone,
     )
     return sched
