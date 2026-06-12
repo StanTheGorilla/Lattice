@@ -9,9 +9,12 @@ Three public entry points:
 from __future__ import annotations
 
 import ast
+import logging
 import math
 import statistics
 import threading
+
+logger = logging.getLogger(__name__)
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -22,13 +25,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # Code validation
 # --------------------------------------------------------------------------- #
 
-_BLOCKED_CALLS = {"eval", "exec", "open", "compile", "__import__", "breakpoint"}
+_BLOCKED_CALLS = {
+    "eval", "exec", "open", "compile", "__import__", "breakpoint",
+    # P1-7: block reflection helpers that re-open the import door.
+    "getattr", "setattr", "delattr", "vars", "globals", "locals", "input",
+}
 
 _REQUIRED_FUNC = "run"
 
 
 def validate_code(code: str) -> None:
-    """Raise ValueError if code contains forbidden constructs or missing run()."""
+    """Raise ValueError if code contains forbidden constructs or missing run().
+
+    P1-7: dunder attribute walks (``"".__class__.__mro__[1].__subclasses__()``)
+    let restricted-exec code reach `os` / `subprocess` via Python's object
+    graph. Since the research agent can pipe untrusted web text into the AI's
+    code-generation path, prompt-injection → code execution is a real risk.
+    Reject any ``ast.Attribute`` whose attribute starts with ``__``, plus the
+    reflection helpers (`getattr`/`setattr`/`vars`/`globals`) that achieve
+    the same thing without a literal dunder.
+
+    Limitation (documented, not fixed here): `execute_algorithm` uses a
+    daemon-thread join with a wall-clock timeout. Python cannot interrupt a
+    running thread, so an infinite loop continues to burn a Pi core after
+    `TimeoutError` is raised. Long-term we want a subprocess with
+    ``resource`` limits; for now we at least warn-log timeout cases so the
+    owner sees them.
+    """
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
@@ -42,6 +65,17 @@ def validate_code(code: str) -> None:
             )
         if isinstance(node, ast.Global):
             raise ValueError("global statements are not allowed")
+        if isinstance(node, ast.Attribute):
+            # Reject every dunder attribute access — `.__class__`,
+            # `.__mro__`, `.__subclasses__`, `.__globals__`, etc. — which
+            # are the standard sandbox-escape chains.
+            if node.attr.startswith("__"):
+                raise ValueError(
+                    f"dunder attribute access ('.{node.attr}') is not allowed",
+                )
+        if isinstance(node, ast.Name) and node.id in _BLOCKED_CALLS:
+            # Catches `g = getattr` then `g(x, '__class__')` etc.
+            raise ValueError(f"reference to '{node.id}' is not allowed")
         if isinstance(node, ast.Call):
             func = node.func
             name = None
@@ -132,6 +166,16 @@ def execute_algorithm(code: str, data: dict[str, Any], timeout: float = 5.0) -> 
     thread.join(timeout=timeout)
 
     if thread.is_alive():
+        # P1-7: daemon threads cannot be force-killed in CPython, so an
+        # infinite-loop algorithm will keep burning a core after this
+        # returns. Surfacing this at WARNING so the owner sees recurring
+        # offenders in the log; the long-term fix is a subprocess sandbox
+        # with `resource` limits (see module docstring).
+        logger.warning(
+            "algorithm thread exceeded %.1fs timeout — daemon thread leaks "
+            "until process restart",
+            timeout,
+        )
         raise TimeoutError(f"algorithm exceeded {timeout}s timeout")
     if error_box[0] is not None:
         raise error_box[0]
@@ -168,7 +212,7 @@ async def fetch_algorithm_data(
         cutoff = (now - timedelta(days=days)).isoformat()
         stmt = (
             select(Metric)
-            .where(Metric.name == metric_name, Metric.timestamp >= cutoff)
+            .where(Metric.metric_name == metric_name, Metric.timestamp >= cutoff)
             .order_by(Metric.timestamp.asc())
         )
         rows = list((await session.execute(stmt)).scalars().all())
@@ -206,8 +250,8 @@ async def fetch_algorithm_data(
             result["calendar"] = [
                 {
                     "title": e.title,
-                    "start": e.start_time,
-                    "end": e.end_time,
+                    "start": e.start,
+                    "end": e.end,
                     "is_all_day": e.is_all_day,
                 }
                 for e in events
