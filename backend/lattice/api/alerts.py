@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lattice.auth import require_auth
 from lattice.config import settings
 from lattice.db import get_session
+from lattice.functions.alert_checker import run_alert_check
 from lattice.models.alert import AlertEvent, AlertRule
 
 router = APIRouter(
@@ -111,6 +112,19 @@ async def delete_rule(
         raise HTTPException(status_code=404, detail="alert rule not found")
     await session.delete(rule)
     await session.commit()
+
+
+@router.post("/check")
+async def check_now(
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, int]:
+    """Manually evaluate all active rules now (the same logic the hourly job runs).
+
+    Returns the number of alerts fired. Useful for testing without waiting for
+    the scheduled job, and works even when the scheduler is disabled in dev.
+    """
+    fired = await run_alert_check(session)
+    return {"fired": fired}
 
 
 @router.get("/events", response_model=list[AlertEventOut])
