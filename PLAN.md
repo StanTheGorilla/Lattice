@@ -604,6 +604,187 @@ Key classification table entries (sample):
 
 ---
 
+## Phase 2L — Subsystems added since the original SPEC freeze
+
+Status: a–d implemented; documented here retroactively (2026-06-12) per
+IMPROVEMENT_PLAN.md P2-1 so future sessions don't work from the empty
+state. Each subsystem already has migrations and code; this section
+captures scope + decisions for context. Tests where noted; gaps in
+coverage are tracked under "Known follow-ups".
+
+### 2L-a — Custom algorithms + sandbox
+- [x] `models/custom_algorithm.py` + migration `0012_custom_algorithms.py` —
+  `(id, name, code, data_requirements JSON, created_at, updated_at)`. Single
+  source of truth for AI-authored Python algorithms the user can re-run.
+- [x] `llm/sandbox.py` — three public entry points:
+  - `validate_code(code)` — AST check: no imports, no `eval`/`exec`/`open`,
+    no `__import__`, no `getattr`/`setattr`/`vars`/`globals` (P1-7), no
+    dunder attribute access (P1-7). Requires a top-level `def run(data):`.
+  - `execute_algorithm(code, data, timeout=5.0)` — restricted exec via
+    `_SAFE_BUILTINS` in a daemon thread with a wall-clock timeout.
+    Documented limitation: CPython can't kill a runaway thread; we
+    warn-log timeouts (P1-7) so the owner sees them.
+  - `fetch_algorithm_data(session, requirements)` — async data fetcher
+    driven by the algorithm's declared `data_requirements` JSON.
+- [x] `api/algorithms.py` — CRUD endpoints + `POST /run` execution path.
+- [x] `llm/router.py` — handlers + dynamic `algo_{name}` tools so the
+  model can call saved algorithms by name; `create_algorithm` validates
+  before persisting.
+
+Decisions:
+- **2L-a-1** Single-process exec + daemon thread, not subprocess. Pi
+  resources are tight; the AST validator + dunder block is the primary
+  defense. Subprocess + `resource` limits is a future hardening when the
+  threat model warrants it.
+- **2L-a-2** `data` is injected as a dict; no DB access from inside the
+  sandbox. `fetch_algorithm_data` runs in the trusted parent and the
+  result is the *only* state the algorithm sees.
+- **2L-a-3** Storage is by name (kebab-friendly slug). Re-creating with
+  the same name overwrites. The AI is encouraged to iterate.
+
+### 2L-b — User memory (persistent durable facts)
+- [x] `models/user_memory.py` + migration `0011_user_memory.py` —
+  `(id, key, value, created_at, updated_at)`. Singular, AI-owned facts:
+  "user wakes at 06:30 on weekdays", "user is 16, no caffeine after 14:00".
+- [x] `api/memory.py` — CRUD + a `/memory` web page.
+- [x] LLM tools: `remember`, `update_memory`, `forget`. All three are in
+  `WRITE_TOOLS`.
+
+Decisions:
+- **2L-b-1** Memory is durable, separate from chat conversation history
+  (which is pruned at 30 days). The chat history replay drops tool
+  results (2G-9); memory survives that drop intentionally.
+- **2L-b-2** Free-form `value` text — no schema. Lets the AI write
+  whatever observation will be useful to its future self.
+
+### 2L-c — Dashboard cards
+- [x] `models/dashboard_card.py` + migration `0013_dashboard_cards.py`.
+- [x] `api/dashboard.py` — list/update/delete endpoints feeding the
+  Today page's bottom strip.
+- [x] LLM tools: `list_dashboard_cards`, `update_dashboard_card`,
+  `delete_dashboard_card` (the latter two are write tools).
+
+Decisions:
+- **2L-c-1** Cards are AI-curated. The model decides what's worth
+  pinning given the day's state; the user can delete what they don't
+  want. No fixed dashboard layout.
+
+### 2L-d — Nutrition (manual log + goals + LLM-estimated macros)
+- [x] `models/` + migration `0009_nutrition_goals.py` — daily targets.
+- [x] `functions/nutrition.py` + `functions/nutrition_goals.py` —
+  per-day aggregation, comparison to goals.
+- [x] `api/nutrition.py` — endpoints; `llm/router.py` handlers
+  `analyze_food`, `get_daily_nutrition`, `get_nutrition_goals`,
+  `set_nutrition_goals` (write), `get_nutrition_history`.
+
+Decisions:
+- **2L-d-1** Macros are LLM-estimated from `FoodData.description` rather
+  than user-entered, persisted into `FoodNutrition` on the entry row.
+  Owner is opt-in via prompt; no hard accuracy guarantee.
+
+### Known follow-ups (non-blocking, tracked in IMPROVEMENT_PLAN.md P2-2)
+- pytest coverage missing for: `llm/sandbox.py` (validation + escape
+  attempts + timeout), `functions/entry_markers.py`,
+  `functions/nutrition*.py`, `functions/data_freshness.py`, memory
+  tools, `integrations/tavily.py`, `integrations/research.py`.
+- `mypy --strict` baseline has not been re-run since Phase 2J; needs a
+  clean-up pass.
+
+---
+
+## Improvement Pass 2026-06-12 — IMPROVEMENT_PLAN.md execution
+
+Status: P0 + P1 (incl. partial P1-1) + V done; P2-1 backfill (this
+section) done; remaining items documented in IMPROVEMENT_PLAN.md and
+left for the next pass. Working tree: 200 backend tests passing (was
+193 → +7 new health_targets tests + 3 P0-3 fixes).
+
+### P0 — protect the work
+- [x] **P0-1** (done before this session) — initial commit landed at
+  c52a9c3; the parent session converts the COMMIT_GROUPS.md sections
+  produced below into real commits.
+- [x] **P0-2** — nightly SQLite backup job (`_sqlite_backup_job`,
+  03:30 daily) writes `VACUUM INTO data/backups/lattice-YYYY-MM-DD.db`,
+  keeps 14 newest, prunes older. Atomic write via tmp file + rename.
+- [x] **P0-3** — three failing tests fixed:
+  - drink schema: `kind` is now free-text (only lowercased/stripped);
+    classifier still fills `sub_type`/`caffeine_mg`.
+  - sleep stages: test was using a wrong Garmin encoding; code
+    (0=deep, 1=light, 2=rem, 3=awake) is the documented one. Test
+    updated.
+  - weekly stats habit completion: `compute_weekly_stats` clamps
+    `today` into the target week before passing it to F8, so stats for
+    a past ISO week look at the right window.
+- [x] **P0-4** — fail-closed auth: startup raises when uvicorn's
+  detected `--host` is non-loopback and neither `WEB_UI_PASSWORD` nor
+  `BOT_SHARED_SECRET` is set. Per-IP token-bucket rate limit on
+  `/auth/login` (10/min).
+
+### P1 — function-level fixes
+- [~] **P1-1** Timestamp audit — partial: `_conversation_prune_job`
+  now uses a UTC cutoff (Conversation rows are written in UTC). The
+  full audit of every `Entry.timestamp >= local.isoformat()` filter +
+  the data migration normalizing existing rows is deferred to a
+  dedicated session; lexicographic-compare drift is bounded by the
+  local-TZ offset (≤2 h) and no surface broke during the rest of this
+  pass.
+- [x] **P1-2** `sleep_debt` reuses F4's age-aware healthy floor
+  (via the new V-2 health_targets store).
+- [x] **P1-3** F4 and F5 agree: an entry is caffeinated iff
+  `caffeine_mg > 0` (legacy `kind=='coffee'` rows still count).
+- [x] **P1-4** F5's caffeine query extends to bedtime when bedtime is
+  past midnight.
+- [x] **P1-5** F5 surfaces a daily caffeine cap as an informative flag
+  (value comes from the V-2 store; teen default 100 mg, adult 400 mg).
+- [x] **P1-6** `allostatic_load` drops `readiness_score` (was double-
+  counting underlying systems), removes the dead `_QUARTILE_WINDOW`
+  constant, softens the interpretation text so 1-2/7 reads as normal
+  variation.
+- [x] **P1-7** Sandbox blocks dunder attribute access + reflection
+  helpers (`getattr`/`setattr`/`vars`/`globals`/`locals`); warn-logs
+  daemon-thread timeouts; fixes two latent bugs in
+  `fetch_algorithm_data` (`Metric.name` → `metric_name`,
+  `CalendarCache.start_time` → `.start`).
+
+### V — AI-as-expert personalization
+- [x] **V-1** `functions/health_targets.py` keyed store (five kinds in
+  the existing `recommendations` table, sentinel `target_date='*'`).
+- [x] **V-2** F4, F5, sleep_debt all read the store, falling back to
+  the previous static defaults when no AI row exists.
+- [x] **V-3** Per-age outer guardrails clamp writes (logged + appended
+  to rationale). <18: sleep floor ≥ 7 h, ceiling ≤ 11 h, daily caffeine
+  cap ≤ 200 mg. Adults proportionally wider.
+- [x] **V-4** System prompt "EXPERT TARGETS" section instructs the AI
+  to inspect + personalise from age + observed data, citing data in
+  the rationale.
+- [ ] **V-4 (routine seed)** — the weekly `ai_review` seed is *not*
+  shipped this pass. The AI can review targets on demand whenever a
+  sleep/caffeine question lands, and the user can create an
+  `ai_review` routine through the existing UI/tools. Filed as a
+  follow-up under IMPROVEMENT_PLAN.md V.
+- [x] **V-5** Tests: store invariants (AI row wins, seed fallback
+  after clear, age-aware seeds, clamping, adult-vs-teen bounds widen
+  correctly).
+
+### Decisions log (Improvement Pass)
+- **IP-1** Health targets reuse the existing `recommendations` table
+  with a sentinel `target_date='*'`, not a separate `health_targets`
+  table. Same invariants, one fewer migration, no schema drift.
+- **IP-2** Clamping is performed on write, not on read. The stored
+  value is always inside the guardrails so any future bug in the read
+  path can't surface an out-of-range target.
+- **IP-3** The `Profile.target_sleep_min` field still overrides the
+  AI target in sleep_debt and F4. Explicit owner choice beats AI
+  judgement; the V store is the layer between "static age table" and
+  "user-set override".
+- **IP-4** P1-1 left partial deliberately. The cross-cutting timestamp
+  rewrite + data migration is too big to land alongside V without
+  risking the recommendation_store invariants — slotted as the next
+  pass's headline item.
+- **IP-5** P3-3 staleness watchdog kept open. The
+  `functions/data_freshness.py` plumbing exists; wiring a default
+  alert is one routine away (Routines surface already in place).
+
 ## Decisions log
 
 - **2A-1** (resolved): `weekly_reports` gets a dedicated table with columns `id, iso_week, generated_at, model_used, stats_json, summary_text`. SPEC §4 updated.
