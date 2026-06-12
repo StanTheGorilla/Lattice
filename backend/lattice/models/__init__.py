@@ -21,6 +21,7 @@ from lattice.models.habit import HabitCheckin, HabitDefinition  # noqa: E402, F4
 from lattice.models.llm_usage import LLMUsage  # noqa: E402, F401
 from lattice.models.metric import Metric  # noqa: E402, F401
 from lattice.models.metric_sample import MetricSample  # noqa: E402, F401
+from lattice.models.recommendation import Recommendation  # noqa: E402, F401
 from lattice.models.planning import (  # noqa: E402, F401
     AIRule,
     Area,
@@ -30,17 +31,23 @@ from lattice.models.planning import (  # noqa: E402, F401
     Profile,
 )
 from lattice.models.sleep_stage import SleepStage  # noqa: E402, F401
+from lattice.models.custom_algorithm import CustomAlgorithm  # noqa: E402, F401
+from lattice.models.dashboard_card import DashboardCard  # noqa: E402, F401
+from lattice.models.routine import Routine  # noqa: E402, F401
+from lattice.models.user_memory import UserMemory  # noqa: E402, F401
 from lattice.models.weekly_report import WeeklyReport  # noqa: E402, F401
 from lattice.models.workout import Workout  # noqa: E402, F401
 
 __all__ = [
     "AIRule",
+    "CustomAlgorithm",
     "AlertEvent",
     "AlertRule",
     "Area",
     "Base",
     "CalendarCache",
     "Conversation",
+    "DashboardCard",
     "Decision",
     "Entry",
     "HabitCheckin",
@@ -51,7 +58,10 @@ __all__ = [
     "Metric",
     "MetricSample",
     "Profile",
+    "Recommendation",
+    "Routine",
     "SleepStage",
+    "UserMemory",
     "WeeklyReport",
     "Workout",
 ]
