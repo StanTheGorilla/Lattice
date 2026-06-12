@@ -25,16 +25,53 @@ from logging.handlers import RotatingFileHandler
 
 import discord
 import httpx
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from lattice_bot.backend_client import BackendError, make_client, post_chat
-from lattice_bot.briefings import schedule as schedule_briefings
 from lattice_bot.config import LOGS_DIR, settings
 from lattice_bot.formatters import split_for_discord
 
 logger = logging.getLogger(__name__)
 
 SESSION_IDLE_MINUTES = 30
+
+# Discord markdown chars that would otherwise mangle a label (underscores
+# trigger italics) when rendered inside the italic actions line.
+_MD_SPECIALS = ("\\", "_", "*", "`", "~", "|")
+
+# Human-friendly labels for the backend's write-tool names (see WRITE_TOOLS in
+# backend/lattice/llm/router.py). Keeps the actions line readable and uniform.
+_ACTION_LABELS = {
+    "log_entry": "entry logged",
+    "delete_entry": "entry deleted",
+    "patch_entry": "entry updated",
+    "check_habit": "habit check-in",
+    "create_calendar_event": "calendar event created",
+    "patch_calendar_event": "calendar event updated",
+    "delete_calendar_event": "calendar event deleted",
+    "sync_garmin": "garmin sync",
+    "sync_calendar": "calendar sync",
+    "save_plan": "plan saved",
+    "save_research_paper": "research paper saved",
+    "set_nutrition_goals": "nutrition goals set",
+    "remember": "memory saved",
+    "update_memory": "memory updated",
+    "forget": "memory removed",
+    "render_chart": "chart added",
+    "update_dashboard_card": "chart updated",
+    "delete_dashboard_card": "chart removed",
+}
+
+
+def _escape_md(text: str) -> str:
+    """Backslash-escape Discord markdown so a label renders literally."""
+    for ch in _MD_SPECIALS:
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _action_label(name: str) -> str:
+    """Friendly label for a tool name; unknown names fall back to spaced text."""
+    return _ACTION_LABELS.get(name, name.replace("_", " "))
 
 
 def _setup_logging() -> None:
@@ -71,7 +108,6 @@ class LatticeBot(discord.Client):
         self._session_id: str = uuid.uuid4().hex
         self._last_activity_ts: float = 0.0
         self._owner_id: int | None = self._parse_owner_id()
-        self._briefings: AsyncIOScheduler | None = None
 
     @staticmethod
     def _parse_owner_id() -> int | None:
@@ -98,9 +134,6 @@ class LatticeBot(discord.Client):
         self.http_client = make_client()
 
     async def close(self) -> None:
-        if self._briefings is not None:
-            self._briefings.shutdown(wait=False)
-            self._briefings = None
         if self.http_client is not None:
             await self.http_client.aclose()
         await super().close()
@@ -111,18 +144,6 @@ class LatticeBot(discord.Client):
             "logged in as %s (id=%s); owner=%s; backend=%s",
             self.user, self.user.id, self._owner_id, settings.backend_url,
         )
-        # Start briefings only once, after login is confirmed and owner is known.
-        if (
-            self._briefings is None
-            and self._owner_id is not None
-            and self.http_client is not None
-        ):
-            self._briefings = schedule_briefings(
-                self,
-                http_client=self.http_client,
-                owner_id=self._owner_id,
-                tz=settings.timezone,
-            )
 
     async def on_message(self, message: discord.Message) -> None:
         # Ignore self.
@@ -176,7 +197,16 @@ class LatticeBot(discord.Client):
 
         text = reply.reply or "(empty response)"
         if reply.actions_taken:
-            text += "\n\n_actions: " + ", ".join(reply.actions_taken) + "_"
+            counts: dict[str, int] = {}
+            for action in reply.actions_taken:
+                counts[action] = counts.get(action, 0) + 1
+            summary = ", ".join(
+                f"{_escape_md(_action_label(name))} ×{n}"
+                if n > 1
+                else _escape_md(_action_label(name))
+                for name, n in counts.items()
+            )
+            text += "\n\n_actions: " + summary + "_"
         await self._send_chunks(message.channel, text)
 
     @staticmethod

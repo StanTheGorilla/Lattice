@@ -24,16 +24,17 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from lattice.config import settings
 from lattice.db import SessionLocal
 from lattice.functions.alert_checker import run_alert_check
 from lattice.functions.readiness import compute_readiness
+from lattice.functions.routine_runner import run_routine
 from lattice.functions.weekly_report import generate_weekly_report
 from lattice.integrations.garmin import GarminAuthError, GarminUnavailable
-from lattice.models import Conversation, Metric
+from lattice.models import Conversation, Metric, Routine
 from lattice.sync.calendar_sync import prune_old_events
 from lattice.sync.garmin_sync import sync_recent
 
@@ -56,6 +57,12 @@ async def _garmin_hourly_job() -> None:
         logger.warning("garmin transient unavailable: %s", exc)
     except Exception:  # noqa: BLE001
         logger.exception("garmin hourly sync crashed")
+
+    # Recompute today's readiness now that fresh component data has landed.
+    # Without this the persisted readiness_score stays frozen at the 06:00
+    # value (often computed before overnight metrics synced), which makes
+    # alerts and weekly stats fire on stale data.
+    await _readiness_compute_job()
 
 
 async def _readiness_compute_job() -> None:
@@ -149,6 +156,106 @@ async def _weekly_report_job() -> None:
         logger.exception("weekly report crashed")
 
 
+# --------------------------------------------------------------------------- #
+# Routines (Phase B) — one CronTrigger per enabled routine, live-editable.
+# --------------------------------------------------------------------------- #
+
+
+def _routine_job_id(routine_id: int) -> str:
+    return f"routine_{routine_id}"
+
+
+def _weekday_mask_to_cron(mask: int) -> str:
+    """7-bit mask (bit 0 = Monday) → APScheduler day_of_week string.
+
+    APScheduler's day_of_week uses 0-6 = Mon-Sun, matching our bit order.
+    """
+    days = [str(i) for i in range(7) if mask & (1 << i)]
+    if len(days) == 7:
+        return "*"
+    return ",".join(days) if days else "*"
+
+
+async def _run_routine_job(routine_id: int) -> None:
+    """Scheduler entrypoint for one routine — fails soft, never crashes."""
+    try:
+        async with SessionLocal() as session:
+            routine = await session.get(Routine, routine_id)
+            if routine is None or not routine.enabled:
+                return
+            result = await run_routine(session, routine)
+            await session.commit()
+        logger.info(
+            "routine %s fired: type=%s sent=%s suppressed=%s",
+            routine_id, result.type, result.sent, result.suppressed,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("routine %s crashed", routine_id)
+
+
+def _add_routine_job(sched: AsyncIOScheduler, routine: Routine) -> None:
+    sched.add_job(
+        _run_routine_job,
+        trigger=CronTrigger(
+            day_of_week=_weekday_mask_to_cron(routine.weekday_mask),
+            hour=routine.hour,
+            minute=routine.minute,
+        ),
+        id=_routine_job_id(routine.id),
+        args=[routine.id],
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+
+async def reschedule(routine_id: int) -> None:
+    """Re-register (or remove) a routine's job after a live create/edit/toggle.
+
+    No-op when the scheduler is disabled (dev) — jobs only exist in prod mode.
+    """
+    if _scheduler is None:
+        return
+    async with SessionLocal() as session:
+        routine = await session.get(Routine, routine_id)
+    if routine is None or not routine.enabled:
+        remove_routine_job(routine_id)
+        return
+    _add_routine_job(_scheduler, routine)
+    logger.info(
+        "routine %s (re)scheduled — %02d:%02d mask=%d",
+        routine_id, routine.hour, routine.minute, routine.weekday_mask,
+    )
+
+
+def remove_routine_job(routine_id: int) -> None:
+    """Drop a routine's scheduled job if present. No-op when disabled/missing."""
+    if _scheduler is None:
+        return
+    if _scheduler.get_job(_routine_job_id(routine_id)) is not None:
+        _scheduler.remove_job(_routine_job_id(routine_id))
+        logger.info("routine %s job removed", routine_id)
+
+
+async def load_routines() -> None:
+    """Register a job for every enabled routine. Call once after `start()`.
+
+    Separate from `start()` because it needs DB access (async) while `start()`
+    is synchronous. No-op when the scheduler is disabled.
+    """
+    if _scheduler is None:
+        return
+    async with SessionLocal() as session:
+        rows = list(
+            (await session.execute(
+                select(Routine).where(Routine.enabled.is_(True))
+            )).scalars().all()
+        )
+    for routine in rows:
+        _add_routine_job(_scheduler, routine)
+    logger.info("loaded %d enabled routine(s) into scheduler", len(rows))
+
+
 def start() -> AsyncIOScheduler | None:
     global _scheduler
     if settings.lattice_disable_scheduler:
@@ -224,4 +331,4 @@ def shutdown() -> None:
     logger.info("scheduler stopped")
 
 
-__all__ = ["shutdown", "start"]
+__all__ = ["load_routines", "remove_routine_job", "reschedule", "shutdown", "start"]
