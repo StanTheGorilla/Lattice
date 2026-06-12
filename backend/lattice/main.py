@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -37,8 +39,48 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _detected_bind_host() -> str | None:
+    """Best-effort sniff of the host uvicorn is binding to.
+
+    Looks at `--host <value>` / `--host=<value>` in argv first (the way the
+    systemd unit invokes uvicorn), then `UVICORN_HOST`. Returns None when
+    nothing is found, in which case we assume the safe localhost default.
+    """
+    argv = sys.argv
+    for i, arg in enumerate(argv):
+        if arg == "--host" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--host="):
+            return arg.split("=", 1)[1]
+    return os.environ.get("UVICORN_HOST")
+
+
+def _enforce_fail_closed_auth() -> None:
+    """Refuse to start when the API is LAN-exposed without any auth secret.
+
+    The original SPEC assumed a 127.0.0.1 bind; the Pi's systemd unit now
+    binds 0.0.0.0:8000. `require_auth` is permissive when no password is
+    configured, so an unset `WEB_UI_PASSWORD` + non-loopback bind would
+    leave every endpoint reachable from the LAN. Fail closed instead.
+    """
+    host = _detected_bind_host()
+    if host is None or host in _LOOPBACK_HOSTS:
+        return
+    if settings.web_ui_password or settings.bot_shared_secret:
+        return
+    raise RuntimeError(
+        f"refusing to start: host '{host}' is non-loopback but neither "
+        "WEB_UI_PASSWORD nor BOT_SHARED_SECRET is set. Set one of these "
+        "in .env, or bind to 127.0.0.1.",
+    )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> Any:
+    _enforce_fail_closed_auth()
     logger.info(
         "lattice backend starting — tz=%s scheduler=%s",
         settings.timezone,

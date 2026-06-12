@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from typing import Annotated
 
-from fastapi import APIRouter, Cookie, HTTPException, Response, status
+from fastapi import APIRouter, Cookie, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 from lattice.auth import (
@@ -21,6 +23,28 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# In-process token bucket per remote IP — 10 attempts / minute is plenty for
+# a single human, hostile enough for a script. Single-user app, no need for
+# a Redis-backed limiter.
+_LOGIN_RATE_LIMIT_MAX = 10
+_LOGIN_RATE_LIMIT_WINDOW_S = 60.0
+_login_attempts: dict[str, deque[float]] = {}
+
+
+def _check_login_rate_limit(remote_ip: str) -> None:
+    now = time.monotonic()
+    bucket = _login_attempts.setdefault(remote_ip, deque())
+    cutoff = now - _LOGIN_RATE_LIMIT_WINDOW_S
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= _LOGIN_RATE_LIMIT_MAX:
+        logger.warning("auth: rate-limit hit for %s", remote_ip)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited", "message": "too many login attempts"},
+        )
+    bucket.append(now)
+
 
 class LoginRequest(BaseModel):
     password: str
@@ -32,7 +56,11 @@ class StatusResponse(BaseModel):
 
 
 @router.post("/login", status_code=status.HTTP_200_OK)
-async def login(payload: LoginRequest, response: Response) -> dict[str, bool]:
+async def login(
+    payload: LoginRequest, request: Request, response: Response,
+) -> dict[str, bool]:
+    remote = request.client.host if request.client else "unknown"
+    _check_login_rate_limit(remote)
     expected = settings.web_ui_password
     if not expected:
         # Dev-permissive: accept any password but still mint a cookie so the
