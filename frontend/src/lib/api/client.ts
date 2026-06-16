@@ -413,6 +413,34 @@ export const memoryApi = {
 	remove: (id: number) => request<void>(`/memory/${id}`, { method: 'DELETE' })
 };
 
+// ---------- open commitments + AI journal (web-UI parity) ----------
+
+import type {
+	PendingAction,
+	PendingActionListResponse,
+	AIJournalEntry,
+	AIJournalListResponse
+} from './types';
+
+export const pendingActionsApi = {
+	list: () => request<PendingActionListResponse>('/pending-actions'),
+	update: (id: number, patch: Partial<Pick<PendingAction, 'summary' | 'detail' | 'status'>>) =>
+		request<PendingAction>(`/pending-actions/${id}`, {
+			method: 'PATCH',
+			body: JSON.stringify(patch)
+		}),
+	remove: (id: number) => request<void>(`/pending-actions/${id}`, { method: 'DELETE' })
+};
+
+export const journalApi = {
+	list: () => request<AIJournalListResponse>('/journal'),
+	update: (
+		id: number,
+		patch: Partial<Pick<AIJournalEntry, 'entry' | 'kind' | 'trigger' | 'active'>>
+	) => request<AIJournalEntry>(`/journal/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+	remove: (id: number) => request<void>(`/journal/${id}`, { method: 'DELETE' })
+};
+
 // ---------- routines (Phase B) ----------
 
 import type {

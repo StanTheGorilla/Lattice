@@ -29,6 +29,7 @@
 	let input = $state('');
 	let sending = $state(false);
 	let sessionId = $state<string>(newSessionId());
+	let context = $state<{ count: number; limit: number } | null>(null);
 	let bottomEl: HTMLDivElement | undefined = $state();
 	let inputEl: HTMLTextAreaElement | undefined = $state();
 
@@ -44,6 +45,7 @@
 		try {
 			const res = await chatApi.send(sessionId, text);
 			sessionId = res.session_id;
+			context = { count: res.history_count, limit: res.history_limit };
 			messages = [
 				...messages,
 				{
@@ -116,6 +118,11 @@
 <div class="chat-layout">
 	<header class="chat-header">
 		<h1>Chat</h1>
+		{#if context}
+			<span class="context-meter" title="Prior messages replayed to the model this turn, of the {context.limit}-message window">
+				{context.count}/{context.limit} in context
+			</span>
+		{/if}
 		<span class="session-id">session · {sessionId.slice(0, 8)}</span>
 	</header>
 
@@ -205,6 +212,16 @@
 		font-size: 22px;
 		font-weight: 600;
 		letter-spacing: -0.02em;
+	}
+	.context-meter {
+		margin-left: auto;
+		font-family: var(--font-mono);
+		font-size: 10px;
+		color: var(--color-fg-dim);
+		padding: 2px 7px;
+		border: 1px solid var(--color-border-2);
+		border-radius: 999px;
+		white-space: nowrap;
 	}
 	.session-id {
 		font-family: var(--font-mono);

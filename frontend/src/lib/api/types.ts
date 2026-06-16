@@ -438,6 +438,8 @@ export interface ChatResponse {
 	tool_calls: ToolCallSummary[];
 	actions_taken: string[];
 	finish_reason: string;
+	history_count: number;
+	history_limit: number;
 }
 
 // ---------- dashboard cards (Phase 2L-c) ----------
@@ -599,6 +601,36 @@ export interface Memory {
 
 export interface MemoryListResponse {
 	items: Memory[];
+	total: number;
+}
+
+export interface PendingAction {
+	id: number;
+	summary: string;
+	detail: string | null;
+	status: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface PendingActionListResponse {
+	items: PendingAction[];
+	total: number;
+}
+
+export interface AIJournalEntry {
+	id: number;
+	entry: string;
+	kind: string;
+	trigger: string | null;
+	weight: number;
+	active: boolean;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface AIJournalListResponse {
+	items: AIJournalEntry[];
 	total: number;
 }
 

@@ -2,12 +2,15 @@
 	import { onMount } from 'svelte';
 	import Card from '$lib/components/ui/Card.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
-	import { memoryApi } from '$lib/api/client';
+	import { memoryApi, pendingActionsApi, journalApi } from '$lib/api/client';
 	import { toast } from '$lib/toast.svelte';
-	import type { Memory } from '$lib/api/types';
+	import type { Memory, PendingAction, AIJournalEntry } from '$lib/api/types';
 
 	let items = $state<Memory[]>([]);
 	let error = $state<string | null>(null);
+
+	let actions = $state<PendingAction[]>([]);
+	let journal = $state<AIJournalEntry[]>([]);
 
 	let newContent = $state('');
 	let creating = $state(false);
@@ -22,7 +25,69 @@
 		}
 	}
 
-	onMount(load);
+	async function loadActions() {
+		try {
+			actions = (await pendingActionsApi.list()).items;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function loadJournal() {
+		try {
+			journal = (await journalApi.list()).items;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	onMount(() => {
+		load();
+		loadActions();
+		loadJournal();
+	});
+
+	async function resolveAction(id: number) {
+		try {
+			await pendingActionsApi.update(id, { status: 'done' });
+			await loadActions();
+			toast.info('resolved');
+		} catch (e) {
+			toast.error('update failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
+	}
+
+	async function removeAction(id: number) {
+		if (!confirm('delete this commitment?')) return;
+		try {
+			await pendingActionsApi.remove(id);
+			await loadActions();
+			toast.info('deleted');
+		} catch (e) {
+			toast.error('delete failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
+	}
+
+	async function retireEntry(id: number) {
+		try {
+			await journalApi.update(id, { active: false });
+			await loadJournal();
+			toast.info('retired');
+		} catch (e) {
+			toast.error('update failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
+	}
+
+	async function removeEntry(id: number) {
+		if (!confirm('delete this journal entry?')) return;
+		try {
+			await journalApi.remove(id);
+			await loadJournal();
+			toast.info('deleted');
+		} catch (e) {
+			toast.error('delete failed: ' + (e instanceof Error ? e.message : String(e)));
+		}
+	}
 
 	async function addMemory(e: Event) {
 		e.preventDefault();
@@ -87,6 +152,65 @@
 							<span class="sub">saved {savedDate(m.created_at)}</span>
 						</div>
 						<Button variant="ghost" size="sm" onclick={() => remove(m.id)}>forget</Button>
+					</div>
+				</Card>
+			{/each}
+		{/if}
+
+		<div class="section-head">
+			<h2>Open commitments</h2>
+			<span class="sub">{actions.length} · things the assistant said it would do</span>
+		</div>
+		{#if actions.length === 0}
+			<Card>
+				<div class="empty">No open commitments.</div>
+			</Card>
+		{:else}
+			{#each actions as a (a.id)}
+				<Card>
+					<div class="mem-row">
+						<div class="mem-body">
+							<p class="mem-content">{a.summary}</p>
+							{#if a.detail}
+								<span class="sub">{a.detail}</span>
+							{/if}
+							<span class="sub">status: {a.status} · {savedDate(a.created_at)}</span>
+						</div>
+						<div class="row-actions">
+							{#if a.status === 'open'}
+								<Button variant="ghost" size="sm" onclick={() => resolveAction(a.id)}>resolve</Button>
+							{/if}
+							<Button variant="ghost" size="sm" onclick={() => removeAction(a.id)}>delete</Button>
+						</div>
+					</div>
+				</Card>
+			{/each}
+		{/if}
+
+		<div class="section-head">
+			<h2>AI journal</h2>
+			<span class="sub">{journal.length} · self-authored guidance</span>
+		</div>
+		{#if journal.length === 0}
+			<Card>
+				<div class="empty">No journal entries yet.</div>
+			</Card>
+		{:else}
+			{#each journal as j (j.id)}
+				<Card>
+					<div class="mem-row">
+						<div class="mem-body">
+							<p class="mem-content">{j.entry}</p>
+							<span class="sub">
+								{j.kind} · weight {j.weight} · {j.active ? 'active' : 'retired'}
+							</span>
+						</div>
+						<div class="row-actions">
+							{#if j.active}
+								<Button variant="ghost" size="sm" onclick={() => retireEntry(j.id)}>retire</Button>
+							{/if}
+							<Button variant="ghost" size="sm" onclick={() => removeEntry(j.id)}>delete</Button>
+						</div>
 					</div>
 				</Card>
 			{/each}
@@ -168,6 +292,23 @@
 		color: var(--color-fg-dim);
 		padding: 32px 0;
 		text-align: center;
+	}
+	.section-head {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+		margin-top: 12px;
+	}
+	.section-head h2 {
+		margin: 0;
+		font-size: 16px;
+		font-weight: 600;
+		letter-spacing: -0.01em;
+	}
+	.row-actions {
+		display: flex;
+		gap: 6px;
+		flex-shrink: 0;
 	}
 	.mem-row {
 		display: flex;
