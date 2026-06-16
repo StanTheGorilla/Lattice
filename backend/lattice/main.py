@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from lattice.api import (
+    ai_journal,
     alerts,
     algorithms,
     auth,
@@ -27,6 +28,7 @@ from lattice.api import (
     metrics,
     nutrition,
     observability,
+    pending_actions,
     planning,
     reports,
     research,
@@ -143,6 +145,8 @@ app.include_router(nutrition.router, prefix="/api")
 app.include_router(research.router, prefix="/api")
 app.include_router(alerts.router, prefix="/api")
 app.include_router(memory.router, prefix="/api")
+app.include_router(pending_actions.router, prefix="/api")
+app.include_router(ai_journal.router, prefix="/api")
 app.include_router(algorithms.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(routines.router, prefix="/api")

@@ -138,11 +138,32 @@ def _is_within_idle_window(latest_ts: str | None) -> bool:
     return datetime.now(UTC) - ts < timedelta(minutes=settings.chat_session_idle_minutes)
 
 
+def _format_gap(latest_ts: str | None) -> str:
+    """Human gap between `latest_ts` and now, e.g. '3h' or '45m' (rounded)."""
+    if not latest_ts:
+        return "?"
+    try:
+        ts = datetime.fromisoformat(latest_ts)
+    except ValueError:
+        return "?"
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    minutes = (datetime.now(UTC) - ts).total_seconds() / 60.0
+    if minutes < 60:
+        return f"{round(minutes)}m"
+    return f"{round(minutes / 60)}h"
+
+
 async def _load_history(
     session: AsyncSession, session_id: str,
 ) -> list[dict[str, object]]:
-    """Return the prior {role, content, tool_calls?} messages for this session
-    if they are still within the idle window; otherwise empty.
+    """Return the prior {role, content, tool_calls?} messages for this session.
+
+    The full `chat_history_turns` window is replayed whether the session is live
+    or resumed — letting a chat sit no longer trims context. When the latest row
+    is older than the idle threshold we prefix the first retained message with a
+    `[resumed after <gap>]` marker so the model knows time has passed; that is
+    the only difference between a live and a resumed reload.
 
     Persisted as one DB row per message. We cap reload at chat_history_turns
     MESSAGES (rows) — i.e. the last N/2 exchanges (default 20 rows ≈ 10
@@ -166,8 +187,7 @@ async def _load_history(
         return []
 
     latest_ts = rows[0].timestamp
-    if not _is_within_idle_window(latest_ts):
-        return []
+    resumed = not _is_within_idle_window(latest_ts)
 
     # Reverse to chronological order for the model. Only user/assistant
     # plain-text turns are replayed — tool_call sequences from prior turns
@@ -187,6 +207,12 @@ async def _load_history(
         if row.role == "assistant" and getattr(row, "data_digest", None):
             content = f"[{row.data_digest}]\n{row.content}"
         history.append({"role": row.role, "content": content})
+    # Mark the resume gap on the first retained message so the model sees that
+    # time has elapsed since the prior exchange (plain text — no tool blocks).
+    if resumed and history:
+        marker = f"[resumed after {_format_gap(latest_ts)} gap]"
+        first = history[0]
+        first["content"] = f"{marker} {first['content']}"
     return history
 
 
@@ -309,4 +335,6 @@ async def chat(
         tool_calls=tool_summaries,
         actions_taken=result.actions_taken,
         finish_reason=result.finish_reason,
+        history_count=len(history),
+        history_limit=settings.chat_history_turns,
     )

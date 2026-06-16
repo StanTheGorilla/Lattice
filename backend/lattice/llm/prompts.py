@@ -9,6 +9,7 @@ is rebuilt every turn from the current datetime + tz + planning state.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -16,9 +17,32 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lattice.config import settings
-from lattice.models import AIRule, Area, Decision, Initiative, Plan, Profile, UserMemory
+from lattice.models import (
+    AIJournal,
+    AIRule,
+    Area,
+    Decision,
+    Initiative,
+    PendingAction,
+    Plan,
+    Profile,
+    UserMemory,
+)
 
-_MEMORY_RECALL_LIMIT = 40
+# Recency-only recall was capped at 40; relevance ranking (see _score_memories)
+# lets us widen the prompt window to 60 without drowning it in stale facts.
+_MEMORY_RECALL_LIMIT = 60
+_JOURNAL_RECALL_LIMIT = 25
+
+# Words too common to carry topical signal when scoring memory relevance.
+_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "are", "as", "at", "be", "by", "do", "for", "from",
+        "had", "has", "have", "how", "i", "in", "is", "it", "me", "my", "of",
+        "on", "or", "that", "the", "to", "was", "what", "when", "with", "you",
+        "your",
+    }
+)
 
 SYSTEM_PROMPT_TEMPLATE = """You are Lattice, a personal optimization assistant for {user_name}.
 
@@ -39,6 +63,32 @@ Consolidate with `update_memory` instead of creating duplicates, and `forget` wh
 wrong. NEVER store biometric/metric values, calendar contents, or anything you can
 fetch with a data tool — that data changes and must always be re-fetched.
 
+OPEN COMMITMENTS
+Whenever the user asks you to do something you cannot finish this turn, or that is
+waiting on their confirmation (e.g. "add this to my calendar once we settle the time",
+"research X and get back to me"), call `note_pending_action` to record it. Your open
+commitments are listed at the END of this prompt under "OPEN COMMITMENTS", each with an
+[id], every turn — so you carry them forward instead of forgetting. Call
+`resolve_pending_action` (outcome 'done' or 'dropped') once you have completed the
+commitment or the user has abandoned it.
+
+LEARNING & JOURNALING
+You keep an AI JOURNAL — soft guidance you write to YOURSELF so you improve the longer
+the user works with you. Your active entries are listed near the END of this prompt under
+"AI JOURNAL", each with an [id]. Maintain it actively:
+- When the user CORRECTS you, call `journal_observation` with kind 'correction'.
+- When you NOTICE a durable style, preference, or pattern (e.g. they format lists with
+  "- " dashes, dislike hedging, already cut caffeine after 14:00), call
+  `journal_observation` with kind 'observation'. Store behavior guidance for yourself —
+  not facts about the user (those go to `remember`).
+- Before adding, scan the AI JOURNAL block for a near-duplicate. If one exists, call
+  `reinforce_journal` with its [id] instead of re-adding.
+- When a preference reverses or an entry goes stale, call `retire_journal`.
+The journal is SOFT: it never overrides the user's in-the-moment instruction or a HARD
+user-defined rule — the user always wins. Be TRANSPARENT: whenever you journal something,
+surface a short inline tag in your reply — "(noted: …)" for an observation, "(learned:
+…)" for a correction — so the user sees that it stuck.
+
 PLANNING SYSTEM — PROTOCOLS, AREAS, INITIATIVES, DECISIONS
 The user runs their life via a structured planning system. You must respect it:
 - Protocols: AI-created goal protocols. When the user asks you to create a protocol, you
@@ -50,6 +100,9 @@ The user runs their life via a structured planning system. You must respect it:
   When they conflict, surface the conflict — do not silently pick one.
 - Decisions: open questions the user is weighing. Frame advice as decision input
   (data, considerations), never as the final answer.
+When you produce a multi-step plan, schedule, or protocol the user accepts (e.g. a
+study plan, a training block), call `save_plan` so it persists across sessions instead
+of relying on conversation memory — the conversation is wiped, the Plan store is not.
 The user's current profile, protocols, areas, initiatives, decisions, and rules are
 listed at the END of this prompt under "CURRENT PLANNING STATE".
 
@@ -566,6 +619,9 @@ USER PROFILE
 PERSISTENT MEMORY (saved facts — [id] content):
 {memory_block}
 
+OPEN COMMITMENTS (resolve or carry forward):
+{pending_block}
+
 ACTIVE PROTOCOLS (the user's primary stated goals — reference these in every analysis):
 {plans_block}
 
@@ -577,6 +633,9 @@ OPEN DECISIONS (the user is currently weighing these):
 
 USER-DEFINED RULES (HARD — these override any default behavior):
 {rules_block}
+
+AI JOURNAL (self-authored soft guidance — follow unless the user overrides):
+{journal_block}
 
 SAVED ALGORITHMS (saved):
 {algorithms_block}
@@ -733,7 +792,60 @@ def _format_plans(rows: list[Plan]) -> str:
     return "\n".join(out)
 
 
-async def build_planning_context(session: AsyncSession) -> dict[str, str]:
+def _format_pending_actions(rows: list[PendingAction]) -> str:
+    """Format open commitments as `- [id] summary — detail` lines."""
+    if not rows:
+        return "  (no open commitments)"
+    out: list[str] = []
+    for r in rows:
+        line = f"- [{r.id}] {r.summary}"
+        if r.detail:
+            line += f" — {r.detail}"
+        out.append(line)
+    return "\n".join(out)
+
+
+def _format_journal(rows: list[AIJournal]) -> str:
+    """Format self-authored soft guidance as `- [id] entry (×weight)` lines."""
+    if not rows:
+        return "  (nothing learned yet)"
+    out: list[str] = []
+    for r in rows:
+        line = f"- [{r.id}] {r.entry}"
+        if r.weight > 1:
+            line += f" (×{r.weight})"
+        out.append(line)
+    return "\n".join(out)
+
+
+def _score_memories(memories: list[UserMemory], user_message: str | None) -> list[UserMemory]:
+    """Rank recalled memories by topical overlap with the user's message.
+
+    Pure + deterministic (no embeddings/FTS5). When `user_message` is None we
+    preserve pure-recency order (callers already pass recency-sorted rows). When
+    a message is given, score by lowercased \\w+ token overlap (stopwords
+    dropped) and sort by (score desc, created_at desc), returning the top
+    `_MEMORY_RECALL_LIMIT`.
+    """
+    if not user_message:
+        return memories[:_MEMORY_RECALL_LIMIT]
+    msg_tokens = {t for t in re.findall(r"\w+", user_message.lower()) if t not in _STOPWORDS}
+    if not msg_tokens:
+        return memories[:_MEMORY_RECALL_LIMIT]
+
+    def score(m: UserMemory) -> int:
+        mem_tokens = {
+            t for t in re.findall(r"\w+", (m.content or "").lower()) if t not in _STOPWORDS
+        }
+        return len(mem_tokens & msg_tokens)
+
+    ranked = sorted(memories, key=lambda m: (score(m), m.created_at or ""), reverse=True)
+    return ranked[:_MEMORY_RECALL_LIMIT]
+
+
+async def build_planning_context(
+    session: AsyncSession, *, user_message: str | None = None
+) -> dict[str, str]:
     """Read profile + plans + active initiatives + open decisions + active rules.
 
     Defensive — failures return placeholder strings; the chat loop must never
@@ -786,14 +898,37 @@ async def build_planning_context(session: AsyncSession) -> dict[str, str]:
 
     memories: list[UserMemory] = []
     try:
-        stmt4 = (
-            select(UserMemory)
-            .order_by(UserMemory.created_at.desc())
-            .limit(_MEMORY_RECALL_LIMIT)
-        )
-        memories = list((await session.execute(stmt4)).scalars().all())
+        # With a user message we fetch a wider candidate set then relevance-rank
+        # it down to _MEMORY_RECALL_LIMIT; without one we stay pure-recency.
+        candidate_limit = 80 if user_message else _MEMORY_RECALL_LIMIT
+        stmt4 = select(UserMemory).order_by(UserMemory.created_at.desc()).limit(candidate_limit)
+        candidates = list((await session.execute(stmt4)).scalars().all())
+        memories = _score_memories(candidates, user_message)
     except Exception:  # pragma: no cover
         memories = []
+
+    pending_rows: list[PendingAction] = []
+    try:
+        stmt_pending = (
+            select(PendingAction)
+            .where(PendingAction.status == "open")
+            .order_by(PendingAction.created_at.asc())
+        )
+        pending_rows = list((await session.execute(stmt_pending)).scalars().all())
+    except Exception:  # pragma: no cover
+        pending_rows = []
+
+    journal_rows: list[AIJournal] = []
+    try:
+        stmt_journal = (
+            select(AIJournal)
+            .where(AIJournal.active.is_(True))
+            .order_by(AIJournal.weight.desc(), AIJournal.updated_at.desc())
+            .limit(_JOURNAL_RECALL_LIMIT)
+        )
+        journal_rows = list((await session.execute(stmt_journal)).scalars().all())
+    except Exception:  # pragma: no cover
+        journal_rows = []
 
     from lattice.models import CustomAlgorithm  # noqa: PLC0415
     algorithms: list[CustomAlgorithm] = []
@@ -806,6 +941,8 @@ async def build_planning_context(session: AsyncSession) -> dict[str, str]:
     return {
         "profile_block": _format_profile(profile),
         "memory_block": _format_memory(memories),
+        "pending_block": _format_pending_actions(pending_rows),
+        "journal_block": _format_journal(journal_rows),
         "plans_block": _format_plans(plan_rows),
         "initiatives_block": _format_initiatives(init_rows),
         "decisions_block": _format_decisions(decision_rows),
@@ -817,6 +954,8 @@ async def build_planning_context(session: AsyncSession) -> dict[str, str]:
 _EMPTY_PLANNING = {
     "profile_block": "  (planning context unavailable)",
     "memory_block": "  (none saved yet)",
+    "pending_block": "  (no open commitments)",
+    "journal_block": "  (nothing learned yet)",
     "plans_block": "  (planning context unavailable)",
     "initiatives_block": "  (planning context unavailable)",
     "decisions_block": "  (planning context unavailable)",
@@ -844,6 +983,8 @@ def build_system_prompt(
         user_name=settings.user_name,
         profile_block=ctx["profile_block"],
         memory_block=ctx["memory_block"],
+        pending_block=ctx.get("pending_block", "  (no open commitments)"),
+        journal_block=ctx.get("journal_block", "  (nothing learned yet)"),
         plans_block=ctx["plans_block"],
         initiatives_block=ctx["initiatives_block"],
         decisions_block=ctx["decisions_block"],

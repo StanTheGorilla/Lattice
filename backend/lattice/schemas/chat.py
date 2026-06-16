@@ -39,6 +39,10 @@ class ChatResponse(BaseModel):
     tool_calls: list[ToolCallSummary] = Field(default_factory=list)
     actions_taken: list[str] = Field(default_factory=list)
     finish_reason: str = "stop"
+    # How many prior messages were replayed to the model this turn, and the cap
+    # (chat_history_turns). Lets the UI surface context-window usage, e.g. "12/20".
+    history_count: int = 0
+    history_limit: int = 0
 
 
 __all__ = ["ChatRequest", "ChatResponse", "ToolCallSummary"]

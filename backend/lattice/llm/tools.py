@@ -1658,6 +1658,140 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    # ---- open commitments ----
+    {
+        "type": "function",
+        "function": {
+            "name": "note_pending_action",
+            "description": (
+                "Record an OPEN COMMITMENT — something the user asked you to do that you "
+                "cannot finish this turn, or that is waiting on the user's confirmation "
+                "(e.g. 'add this to my calendar once you confirm the time', 'research X "
+                "and report back tomorrow'). Open commitments are shown to you every turn "
+                "under OPEN COMMITMENTS with their [id], so you carry them forward across "
+                "sessions instead of forgetting. Keep the summary short and specific; put "
+                "any context needed to act later in detail. Resolve it with "
+                "resolve_pending_action once done or abandoned."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Short description of the commitment (max 300 chars).",
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": "Optional extra context needed to act on it later.",
+                    },
+                },
+                "required": ["summary"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resolve_pending_action",
+            "description": (
+                "Close an OPEN COMMITMENT once you have completed it or the user abandoned "
+                "it. Use the [id] shown next to the entry under OPEN COMMITMENTS. Set "
+                "outcome to 'done' when finished, 'dropped' when the user no longer wants it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The open commitment id."},
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["done", "dropped"],
+                        "description": "'done' if completed, 'dropped' if abandoned.",
+                    },
+                },
+                "required": ["id", "outcome"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # ---- ai journal ----
+    {
+        "type": "function",
+        "function": {
+            "name": "journal_observation",
+            "description": (
+                "Write a forward-looking note TO YOURSELF whenever you (a) are corrected by "
+                "the user, or (b) NOTICE a stable preference, style, or pattern in the "
+                "conversation. This is behavior guidance for yourself, NOT a fact about the "
+                "user (facts go to `remember`). Examples: 'user formats lists with `- ` "
+                "dashes → match that', 'user dislikes hedging → answer directly, no "
+                "caveats', 'user already cut caffeine after 14:00 → don't re-suggest it'. "
+                "Set kind to 'correction' when the user explicitly corrected you, else "
+                "'observation'. Use trigger for an optional cue describing WHEN this "
+                "guidance applies (e.g. 'when writing lists'). BEFORE adding, scan the AI "
+                "JOURNAL block in this prompt for a near-duplicate — if one exists, call "
+                "`reinforce_journal` with its [id] instead of re-adding."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry": {
+                        "type": "string",
+                        "description": "The behavior guidance for yourself (max 300 chars).",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["observation", "correction"],
+                        "description": "'correction' if the user corrected you, else 'observation'.",
+                    },
+                    "trigger": {
+                        "type": "string",
+                        "description": "Optional cue for when this guidance applies.",
+                    },
+                },
+                "required": ["entry"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reinforce_journal",
+            "description": (
+                "Bump the weight of an existing AI JOURNAL entry because you observed the "
+                "same preference/pattern again. Use the [id] shown next to the entry under "
+                "AI JOURNAL. Prefer this over re-adding a near-duplicate observation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The journal entry id."},
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retire_journal",
+            "description": (
+                "Deactivate an AI JOURNAL entry that no longer reflects the user — e.g. the "
+                "preference reversed or the guidance is stale. Use the [id] shown next to "
+                "the entry under AI JOURNAL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The journal entry id."},
+                },
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+    },
     # ---- routines (Phase B) ----
     {
         "type": "function",

@@ -13,6 +13,7 @@ class Base(DeclarativeBase):
     """Shared declarative base — all models inherit from this."""
 
 
+from lattice.models.ai_journal import AIJournal  # noqa: E402, F401
 from lattice.models.alert import AlertEvent, AlertRule  # noqa: E402, F401
 from lattice.models.calendar_cache import CalendarCache  # noqa: E402, F401
 from lattice.models.conversation import Conversation  # noqa: E402, F401
@@ -21,6 +22,7 @@ from lattice.models.habit import HabitCheckin, HabitDefinition  # noqa: E402, F4
 from lattice.models.llm_usage import LLMUsage  # noqa: E402, F401
 from lattice.models.metric import Metric  # noqa: E402, F401
 from lattice.models.metric_sample import MetricSample  # noqa: E402, F401
+from lattice.models.pending_action import PendingAction  # noqa: E402, F401
 from lattice.models.recommendation import Recommendation  # noqa: E402, F401
 from lattice.models.planning import (  # noqa: E402, F401
     AIRule,
@@ -40,6 +42,7 @@ from lattice.models.weekly_report import WeeklyReport  # noqa: E402, F401
 from lattice.models.workout import Workout  # noqa: E402, F401
 
 __all__ = [
+    "AIJournal",
     "AIRule",
     "CustomAlgorithm",
     "AlertEvent",
@@ -58,6 +61,7 @@ __all__ = [
     "Plan",
     "Metric",
     "MetricSample",
+    "PendingAction",
     "Profile",
     "Recommendation",
     "Routine",

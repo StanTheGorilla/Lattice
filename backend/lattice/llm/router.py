@@ -1390,6 +1390,8 @@ async def _h_list_plans(session: AsyncSession, args: dict[str, Any]) -> dict[str
 
 
 _MAX_MEMORY_LEN = 500
+_MAX_PENDING_LEN = 300
+_MAX_JOURNAL_LEN = 300
 
 
 async def _h_remember(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
@@ -1440,6 +1442,122 @@ async def _h_forget(session: AsyncSession, args: dict[str, Any]) -> dict[str, An
     await session.delete(row)
     await session.commit()
     return {"forgot": memory_id}
+
+
+async def _h_note_pending_action(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import PendingAction
+
+    summary = str(args.get("summary") or "").strip()
+    if not summary:
+        return _err("summary (non-empty string) required")
+    if len(summary) > _MAX_PENDING_LEN:
+        return _err(f"summary too long (max {_MAX_PENDING_LEN} chars)")
+    detail_raw = args.get("detail")
+    detail = str(detail_raw).strip() if isinstance(detail_raw, str) and detail_raw.strip() else None
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    row = PendingAction(
+        summary=summary,
+        detail=detail,
+        status="open",
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return {"id": row.id, "summary": row.summary, "status": row.status}
+
+
+async def _h_resolve_pending_action(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import PendingAction
+
+    action_id = args.get("id")
+    if not isinstance(action_id, int):
+        return _err("id (int) required")
+    outcome = args.get("outcome")
+    if outcome not in ("done", "dropped"):
+        return _err("outcome must be 'done' or 'dropped'")
+    row = await session.get(PendingAction, action_id)
+    if row is None:
+        return _err(f"pending action {action_id} not found")
+    row.status = outcome
+    row.updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    await session.commit()
+    return {"id": action_id, "status": outcome}
+
+
+async def _h_journal_observation(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from sqlalchemy.exc import IntegrityError
+
+    from lattice.models import AIJournal
+
+    entry = str(args.get("entry") or "").strip()
+    if not entry:
+        return _err("entry (non-empty string) required")
+    if len(entry) > _MAX_JOURNAL_LEN:
+        return _err(f"entry too long (max {_MAX_JOURNAL_LEN} chars)")
+    kind = args.get("kind") or "observation"
+    if kind not in ("observation", "correction"):
+        return _err("kind must be 'observation' or 'correction'")
+    trigger_raw = args.get("trigger")
+    trigger = (
+        str(trigger_raw).strip() if isinstance(trigger_raw, str) and trigger_raw.strip() else None
+    )
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    row = AIJournal(
+        entry=entry,
+        kind=kind,
+        trigger=trigger,
+        weight=1,
+        active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(row)
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Exact-duplicate entry — reinforce the existing row instead of erroring.
+        await session.rollback()
+        existing = (
+            await session.execute(select(AIJournal).where(AIJournal.entry == entry))
+        ).scalar_one()
+        existing.weight += 1
+        existing.updated_at = now
+        await session.commit()
+        return {"id": existing.id, "kind": existing.kind, "weight": existing.weight}
+    await session.refresh(row)
+    return {"id": row.id, "kind": row.kind, "weight": row.weight}
+
+
+async def _h_reinforce_journal(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import AIJournal
+
+    journal_id = args.get("id")
+    if not isinstance(journal_id, int):
+        return _err("id (int) required")
+    row = await session.get(AIJournal, journal_id)
+    if row is None:
+        return _err(f"journal entry {journal_id} not found")
+    row.weight += 1
+    row.updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    await session.commit()
+    return {"id": journal_id, "weight": row.weight}
+
+
+async def _h_retire_journal(session: AsyncSession, args: dict[str, Any]) -> dict[str, Any]:
+    from lattice.models import AIJournal
+
+    journal_id = args.get("id")
+    if not isinstance(journal_id, int):
+        return _err("id (int) required")
+    row = await session.get(AIJournal, journal_id)
+    if row is None:
+        return _err(f"journal entry {journal_id} not found")
+    row.active = False
+    row.updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    await session.commit()
+    return {"id": journal_id, "retired": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -1994,6 +2112,13 @@ HANDLERS = {
     "remember": _h_remember,
     "update_memory": _h_update_memory,
     "forget": _h_forget,
+    # --- open commitments ---
+    "note_pending_action": _h_note_pending_action,
+    "resolve_pending_action": _h_resolve_pending_action,
+    # --- ai journal ---
+    "journal_observation": _h_journal_observation,
+    "reinforce_journal": _h_reinforce_journal,
+    "retire_journal": _h_retire_journal,
     # --- routines (Phase B) ---
     "list_routines": _h_list_routines,
     "create_routine": _h_create_routine,
@@ -2043,6 +2168,8 @@ WRITE_TOOLS = {
     "save_plan", "save_research_paper",
     "set_nutrition_goals", "set_sleep_recommendation", "set_health_targets",
     "remember", "update_memory", "forget",
+    "note_pending_action", "resolve_pending_action",
+    "journal_observation", "reinforce_journal", "retire_journal",
     "create_routine", "update_routine", "delete_routine",
     "create_alert", "delete_alert",
     "create_algorithm",
@@ -2124,7 +2251,7 @@ async def run_agent(
     (handled in `api/chat.py`).
     """
     iters = max_iters or settings.chat_max_iterations
-    planning_ctx = await build_planning_context(session)
+    planning_ctx = await build_planning_context(session, user_message=user_message)
 
     # Load saved algorithms and inject them as dynamic tools
     algo_rows: list[CustomAlgorithm] = []
